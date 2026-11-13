@@ -24,11 +24,32 @@ import {
 import firebaseConfig from '../firebase-applet-config.json';
 
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+const firestoreDbId =
+  (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId ||
+  'ai-studio-477b1a91-56e7-4038-8d3f-ce085b681973';
+export const db = getFirestore(app, firestoreDbId);
 export const auth = getAuth(app);
 
+export const SCOPES = [
+  'https://www.googleapis.com/auth/drive',
+  'https://www.googleapis.com/auth/drive.file',
+  'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/drive.activity',
+  'https://www.googleapis.com/auth/drive.activity.readonly',
+  'https://www.googleapis.com/auth/drive.appdata',
+  'https://www.googleapis.com/auth/drive.apps.readonly',
+  'https://www.googleapis.com/auth/drive.install',
+  'https://www.googleapis.com/auth/drive.meet.readonly',
+  'https://www.googleapis.com/auth/drive.metadata',
+  'https://www.googleapis.com/auth/drive.metadata.readonly',
+  'https://www.googleapis.com/auth/drive.photos.readonly',
+  'https://www.googleapis.com/auth/drive.scripts',
+];
+
 const googleProvider = new GoogleAuthProvider();
-googleProvider.setCustomParameters({ prompt: 'select_account' });
+SCOPES.forEach((scope) => googleProvider.addScope(scope));
 
 export enum OperationType {
   CREATE = 'create',
@@ -91,42 +112,79 @@ async function testConnection() {
       error instanceof Error &&
       error.message.includes('the client is offline')
     ) {
-      console.error('Please check your Firebase configuration.');
+      console.warn('Please check your Firebase configuration.');
     }
   }
 }
 testConnection();
 
-// In-memory access token cache (never stored in localStorage)
-let cachedGoogleAccessToken: string | null = null;
+// Flag to indicate if we are in the middle of a sign-in flow.
+let isSigningInFlow = false;
+// Cache the access token in memory ONLY (never stored in localStorage/sessionStorage).
+let cachedAccessToken: string | null = null;
+
+export const initAuth = (
+  onAuthSuccess?: (user: User, token: string) => void,
+  onAuthFailure?: (user: User | null) => void
+) => {
+  return onAuthStateChanged(auth, async (user: User | null) => {
+    if (user) {
+      if (cachedAccessToken) {
+        if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
+      } else if (!isSigningInFlow) {
+        cachedAccessToken = null;
+        if (onAuthFailure) onAuthFailure(user);
+      }
+    } else {
+      cachedAccessToken = null;
+      if (onAuthFailure) onAuthFailure(null);
+    }
+  });
+};
 
 export const signInWithGmail = async (): Promise<{
   user: User;
-  accessToken: string | null;
-}> => {
-  const result = await signInWithPopup(auth, googleProvider);
-  const credential = GoogleAuthProvider.credentialFromResult(result);
-  cachedGoogleAccessToken = credential?.accessToken || null;
-  return { user: result.user, accessToken: cachedGoogleAccessToken };
+  accessToken: string;
+} | null> => {
+  try {
+    isSigningInFlow = true;
+    const result = await signInWithPopup(auth, googleProvider);
+    const credential = GoogleAuthProvider.credentialFromResult(result);
+    const token = credential?.accessToken || '';
+    cachedAccessToken = token || null;
+    return { user: result.user, accessToken: token };
+  } catch (error: any) {
+    const code = error?.code || '';
+    if (
+      code === 'auth/popup-closed-by-user' ||
+      code === 'auth/cancelled-popup-request' ||
+      code === 'auth/popup-blocked'
+    ) {
+      return null;
+    }
+    return null;
+  } finally {
+    isSigningInFlow = false;
+  }
 };
 
 export const signOutGmail = async (): Promise<void> => {
-  cachedGoogleAccessToken = null;
   await auth.signOut();
+  cachedAccessToken = null;
 };
 
-export const getCachedGoogleAccessToken = (): string | null => {
-  return cachedGoogleAccessToken;
+export const getAccessToken = async (): Promise<string | null> => {
+  return cachedAccessToken;
 };
 
 export const subscribeToAuthChanges = (
-  callback: (user: User | null) => void
+  callback: (user: User | null, token: string | null) => void
 ) => {
   return onAuthStateChanged(auth, (user) => {
     if (!user) {
-      cachedGoogleAccessToken = null;
+      cachedAccessToken = null;
     }
-    callback(user);
+    callback(user, cachedAccessToken);
   });
 };
 

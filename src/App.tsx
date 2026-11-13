@@ -30,11 +30,12 @@ import {
 } from './components/StoryCanvas';
 import { StoryEditorPanel } from './components/StoryEditorPanel';
 import { ArkaAIStudioPanel } from './components/ArkaAIStudioPanel';
+import { GoogleWorkspacePanel } from './components/GoogleWorkspacePanel';
 import { DebugConsole } from './components/DebugConsole';
 import {
+  initAuth,
   signInWithGmail,
   signOutGmail,
-  subscribeToAuthChanges,
 } from './firebase';
 import {
   Download,
@@ -58,14 +59,15 @@ import {
   SlidersHorizontal,
   Eye,
   LogOut,
+  FileSpreadsheet,
 } from 'lucide-react';
 
 const STORAGE_KEY = 'arka_story_studio_v2';
 const CAROUSEL_STORAGE_KEY = 'arka_carousel_decks_v2';
 const ACTIVE_CONFIG_STORAGE_KEY = 'arka_story_active_config_v2';
 
-type MobileTabId = 'preview' | 'editor' | 'ai-studio' | 'gallery';
-type DesktopSidePanelMode = 'editor' | 'ai-studio';
+type MobileTabId = 'preview' | 'ai-studio' | 'editor' | 'workspace' | 'gallery';
+type DesktopSidePanelMode = 'ai-studio' | 'editor' | 'workspace';
 
 export default function App() {
   const [stories, setStories] = useState<ArkaStoryData[]>(() => {
@@ -169,8 +171,10 @@ export default function App() {
   );
   const stageContainerRef = useRef<HTMLDivElement | null>(null);
 
-  // Google / Gmail Auth State
+  // Google Auth + Workspace OAuth Token State
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [needsAuth, setNeedsAuth] = useState<boolean>(true);
   const [isSigningIn, setIsSigningIn] = useState<boolean>(false);
 
   // Logo & Guide state (persisted in localStorage)
@@ -244,30 +248,49 @@ export default function App() {
     ...customPresets,
   ];
 
-  // Subscribe to Firebase Google Auth state
+  // Initialize Firebase Auth & Workspace Token state
   useEffect(() => {
-    const unsub = subscribeToAuthChanges((user) => {
-      setCurrentUser(user);
-    });
+    const unsub = initAuth(
+      (user, token) => {
+        setCurrentUser(user);
+        setAccessToken(token);
+        setNeedsAuth(false);
+      },
+      (user) => {
+        setCurrentUser(user);
+        setAccessToken(null);
+        setNeedsAuth(true);
+      }
+    );
     return () => unsub();
   }, []);
 
-  // Responsive auto-fit scale calculation for mobile & tablet viewports
+  // Responsive ResizeObserver for dynamic container scale calculation
   useEffect(() => {
-    const computeResponsiveScale = () => {
-      const vw = window.innerWidth;
-      if (vw < 640) {
-        // Fit 1080px canvas neatly inside mobile screen with 48px padding margin
-        const availableWidth = Math.max(260, vw - 56);
+    const node = stageContainerRef.current;
+    const computeScale = (containerWidth: number) => {
+      if (containerWidth > 0 && containerWidth < 680) {
+        const availableWidth = Math.max(250, containerWidth - 36);
         const fitScale = +(availableWidth / activeFormat.width).toFixed(2);
-        setPreviewScale(Math.min(activeFormat.defaultPreviewScale, Math.max(0.24, fitScale)));
+        setPreviewScale(
+          Math.min(activeFormat.defaultPreviewScale, Math.max(0.24, fitScale))
+        );
       } else {
         setPreviewScale(activeFormat.defaultPreviewScale);
       }
     };
-    computeResponsiveScale();
-    window.addEventListener('resize', computeResponsiveScale);
-    return () => window.removeEventListener('resize', computeResponsiveScale);
+
+    if (node && typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          computeScale(entry.contentRect.width);
+        }
+      });
+      observer.observe(node);
+      return () => observer.disconnect();
+    } else {
+      computeScale(window.innerWidth);
+    }
   }, [activeFormat]);
 
   useEffect(() => {
@@ -315,15 +338,24 @@ export default function App() {
     if (isSigningIn) return;
     setIsSigningIn(true);
     try {
-      const { user } = await signInWithGmail();
+      const result = await signInWithGmail();
+      if (!result) {
+        setExportStatusMessage(
+          'پنجره ورود با گوگل بسته شد. در صورت مسدود بودن پاپ‌آپ مرورگر، لطفاً اجازه باز شدن پنجره را بدهید و دوباره تلاش کنید.'
+        );
+        setTimeout(() => setExportStatusMessage(null), 4000);
+        return;
+      }
+      setCurrentUser(result.user);
+      setAccessToken(result.accessToken || null);
+      setNeedsAuth(!result.accessToken);
       setExportStatusMessage(
-        `خوش آمدید ${user.displayName || user.email}! حساب جیمیل شما به استودیو هوش مصنوعی آرکا متصل شد.`
+        `خوش آمدید ${result.user.displayName || result.user.email}! دسترسی Google Sheets، Google Drive و هوش مصنوعی آرکا فعال شد.`
       );
       setTimeout(() => setExportStatusMessage(null), 4000);
-    } catch (err: any) {
-      console.error('Google Sign-In failed:', err);
+    } catch {
       setExportStatusMessage(
-        'ورود با حساب گوگل لغو شد یا پنجره پاپ‌آپ بسته شد.'
+        'ورود با حساب گوگل انجام نشد. لطفاً دوباره تلاش کنید.'
       );
       setTimeout(() => setExportStatusMessage(null), 3500);
     } finally {
@@ -333,7 +365,10 @@ export default function App() {
 
   const handleGoogleSignOut = async () => {
     await signOutGmail();
-    setExportStatusMessage('از حساب جیمیل خارج شدید.');
+    setCurrentUser(null);
+    setAccessToken(null);
+    setNeedsAuth(true);
+    setExportStatusMessage('از حساب گوگل خارج شدید.');
     setTimeout(() => setExportStatusMessage(null), 2500);
   };
 
@@ -610,6 +645,23 @@ export default function App() {
     setTimeout(() => setExportStatusMessage(null), 3000);
   };
 
+  // Helper to render the active export canvas to PNG Data URL (used for local download & Google Drive upload)
+  const renderActiveCanvasToPngDataUrl = async (): Promise<string | null> => {
+    await new Promise((r) => setTimeout(r, 120));
+    if (document.fonts?.ready) {
+      await document.fonts.ready;
+    }
+    const node = exportCanvasRef.current;
+    if (!node) return null;
+
+    return toPng(node, {
+      width: activeFormat.width,
+      height: activeFormat.height,
+      pixelRatio: 1,
+      cacheBust: true,
+    });
+  };
+
   const exportSingleCanvasAsPng = async (
     targetStory?: ArkaStoryData,
     targetSlideIdx?: number
@@ -636,19 +688,8 @@ export default function App() {
         await new Promise((r) => setTimeout(r, 120));
       }
 
-      if (document.fonts?.ready) {
-        await document.fonts.ready;
-      }
-
-      const node = exportCanvasRef.current;
-      if (!node) throw new Error('Canvas node not ready');
-
-      const dataUrl = await toPng(node, {
-        width: w,
-        height: h,
-        pixelRatio: 1,
-        cacheBust: true,
-      });
+      const dataUrl = await renderActiveCanvasToPngDataUrl();
+      if (!dataUrl) throw new Error('Canvas node not ready');
 
       const link = document.createElement('a');
       const filePrefix = isCarouselMode
@@ -663,8 +704,7 @@ export default function App() {
       setExportStatusMessage(
         `فایل PNG (${activeFormat.shortLabel} · ${w}×${h}) با موفقیت دانلود شد.`
       );
-    } catch (err) {
-      console.error('Export failed:', err);
+    } catch {
       setExportStatusMessage(
         'خطا در تولید تصویر PNG. لطفاً از لوگوی رسمی داخلی سایت آرکا استفاده کنید.'
       );
@@ -690,18 +730,8 @@ export default function App() {
             `در حال آماده‌سازی و دانلود اسلاید ${i + 1} از ${activeDeck.slides.length} کاروسل (${w}×${h})...`
           );
           await new Promise((r) => setTimeout(r, 350));
-          if (document.fonts?.ready) {
-            await document.fonts.ready;
-          }
-          const node = exportCanvasRef.current;
-          if (!node) continue;
-
-          const dataUrl = await toPng(node, {
-            width: w,
-            height: h,
-            pixelRatio: 1,
-            cacheBust: true,
-          });
+          const dataUrl = await renderActiveCanvasToPngDataUrl();
+          if (!dataUrl) continue;
 
           const link = document.createElement('a');
           link.download = `arka-${activeDeck.id}-slide-${i + 1}-${w}x${h}.png`;
@@ -713,8 +743,7 @@ export default function App() {
         setExportStatusMessage(
           `تمامی ${activeDeck.slides.length} اسلاید کاروسل با ابعاد ${w}×${h} دانلود شدند.`
         );
-      } catch (err) {
-        console.error('Carousel batch export error:', err);
+      } catch {
         setExportStatusMessage('در دانلود گروهی اسلایدهای کاروسل خطایی رخ داد.');
       } finally {
         setActiveCarouselSlideIndex(prevIdx);
@@ -734,19 +763,8 @@ export default function App() {
         );
         await new Promise((r) => setTimeout(r, 350));
 
-        if (document.fonts?.ready) {
-          await document.fonts.ready;
-        }
-
-        const node = exportCanvasRef.current;
-        if (!node) continue;
-
-        const dataUrl = await toPng(node, {
-          width: w,
-          height: h,
-          pixelRatio: 1,
-          cacheBust: true,
-        });
+        const dataUrl = await renderActiveCanvasToPngDataUrl();
+        if (!dataUrl) continue;
 
         const link = document.createElement('a');
         link.download = `arka-${activeFormat.id}-${current.order}-${w}x${h}.png`;
@@ -758,8 +776,7 @@ export default function App() {
       setExportStatusMessage(
         `هر ۶ طرح با ابعاد ${w}×${h} (${activeFormat.shortLabel}) با موفقیت دانلود شدند.`
       );
-    } catch (err) {
-      console.error('Batch export error:', err);
+    } catch {
       setExportStatusMessage('در دانلود گروهی خطایی رخ داد.');
     } finally {
       setActiveStoryId(previousActiveId);
@@ -811,19 +828,12 @@ export default function App() {
     >
       {/* ==================== STRICT 3-ZONE TOP BAR CONTRACT (ARKA-ACC.IR THEME) ==================== */}
       <header className="flex items-center justify-between gap-4 lg:gap-8 px-4 sm:px-6 py-3 border-b border-[#0b2b56] bg-[#062959] text-white sticky top-0 z-40 shadow-md">
-        {/* Zone 1: Brand Wordmark + Official Logo */}
+        {/* Zone 1: Single text element wordmark */}
         <a
           href="#top"
-          className="inline-flex items-center gap-2.5 whitespace-nowrap shrink-0"
+          className="text-base sm:text-lg font-black tracking-tight text-white whitespace-nowrap shrink-0"
         >
-          <img
-            src="/images/arka-header-logo.png"
-            alt="گروه نرم‌افزاری آرکا"
-            className="h-8 sm:h-9 w-auto object-contain"
-          />
-          <span className="text-sm sm:text-base font-black tracking-tight text-white">
-            استودیو هوشمند آرکــا
-          </span>
+          استودیو هوشمند آرکــا
         </a>
 
         {/* Zone 2: 4 concise single-line navigation links */}
@@ -840,7 +850,7 @@ export default function App() {
                 : 'border-transparent'
             }`}
           >
-            استوری و پست تکی (۶)
+            استوری و پست تکی
           </button>
           <button
             type="button"
@@ -872,26 +882,26 @@ export default function App() {
                 : 'border-transparent'
             }`}
           >
-            هوش مصنوعی و سناریونویس
+            هوش مصنوعی آرکا
           </button>
           <button
             type="button"
             onClick={() => {
               setViewMode('studio');
-              setDesktopSideMode('editor');
-              setMobileTab('editor');
+              setDesktopSideMode('workspace');
+              setMobileTab('workspace');
             }}
             className={`hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-1 border-b-2 ${
-              desktopSideMode === 'editor'
+              desktopSideMode === 'workspace'
                 ? 'text-[#14dac3] border-[#08cdbd]'
                 : 'border-transparent'
             }`}
           >
-            ویرایشگر گرافیکی بوم
+            گوگل شیتز و درایو
           </button>
         </nav>
 
-        {/* Zone 3: Primary Action (Export PNG) */}
+        {/* Zone 3: 1 primary action */}
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
@@ -911,30 +921,30 @@ export default function App() {
 
       {/* ==================== STUDIO WORKSPACE CONTROL DECK ==================== */}
       <div className="max-w-[1440px] w-full mx-auto px-4 sm:px-6 pt-4 pb-3 flex flex-col gap-3 border-b border-[#e3e9ed]">
-        {/* Row 1: Studio Title + Google Account Pill + View Mode + Batch Export */}
+        {/* Row 1: Studio Title + Official Sign in with Google + View Mode + Batch Export */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
           <div>
             <h1 className="text-base sm:text-xl font-black text-[#062959] leading-snug">
               استودیو طراحی استوری، پست، کاروسل و هوش مصنوعی نرم‌افزار حسابداری آرکــا
             </h1>
             <p className="text-xs text-[#7e8c9b] mt-0.5">
-              متصل به داده‌های زنده وب‌سایت رسمی{' '}
-              <span className="font-bold text-[#062959]">arka-acc.ir</span> · فونت وزیرمتن · پشتیبانی از دسکتاپ و موبایل
+              متصل به وب‌سایت رسمی{' '}
+              <span className="font-bold text-[#062959]">arka-acc.ir</span> · همگام با Google Sheets و Google Drive · فونت وزیرمتن
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {/* Google Sign-In Quick Button in Workspace Toolbar */}
-            {currentUser ? (
+            {/* Official Sign in with Google Button or Active Account */}
+            {currentUser && !needsAuth ? (
               <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white border border-[#08cdbd] text-xs font-bold text-[#062959]">
-                <span className="truncate max-w-[150px]" dir="ltr">
+                <span className="truncate max-w-[160px]" dir="ltr">
                   {currentUser.email}
                 </span>
                 <button
                   type="button"
                   onClick={handleGoogleSignOut}
                   className="text-rose-600 hover:text-rose-700 cursor-pointer"
-                  title="خروج از جیمیل"
+                  title="خروج از حساب گوگل"
                 >
                   <LogOut className="w-3.5 h-3.5" />
                 </button>
@@ -944,27 +954,40 @@ export default function App() {
                 type="button"
                 disabled={isSigningIn}
                 onClick={handleGoogleSignIn}
-                className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-white hover:bg-[#e5fbf9] border border-[#08cdbd] text-xs font-black text-[#062959] shadow-xs transition-colors cursor-pointer whitespace-nowrap shrink-0 min-h-[40px]"
+                className="gsi-material-button inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-white hover:bg-[#e5fbf9] border border-[#08cdbd] text-xs font-black text-[#062959] shadow-xs transition-colors cursor-pointer whitespace-nowrap shrink-0 min-h-[40px]"
               >
-                <svg className="w-4 h-4 shrink-0" viewBox="0 0 48 48">
-                  <path
-                    fill="#EA4335"
-                    d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
-                  />
-                  <path
-                    fill="#4285F4"
-                    d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
-                  />
-                  <path
-                    fill="#FBBC05"
-                    d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
-                  />
-                  <path
-                    fill="#34A853"
-                    d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
-                  />
-                </svg>
-                <span>ورود با جیمیل</span>
+                <div className="gsi-material-button-state" />
+                <div className="gsi-material-button-content-wrapper flex items-center gap-2">
+                  <div className="gsi-material-button-icon w-4 h-4 shrink-0">
+                    <svg
+                      version="1.1"
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 48 48"
+                      style={{ display: 'block' }}
+                    >
+                      <path
+                        fill="#EA4335"
+                        d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+                      />
+                      <path
+                        fill="#4285F4"
+                        d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
+                      />
+                      <path
+                        fill="#FBBC05"
+                        d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
+                      />
+                      <path
+                        fill="#34A853"
+                        d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+                      />
+                      <path fill="none" d="M0 0h48v48H0z" />
+                    </svg>
+                  </div>
+                  <span className="gsi-material-button-contents">
+                    {isSigningIn ? 'در حال اتصال...' : 'Sign in with Google'}
+                  </span>
+                </div>
               </button>
             )}
 
@@ -1025,7 +1048,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Row 2: FORMAT & ASPECT RATIO SELECTOR BAR (Scrollable on Mobile) */}
+        {/* Row 2: FORMAT & ASPECT RATIO SELECTOR BAR */}
         <div className="bg-white border border-[#e3e9ed] rounded-2xl p-2.5 sm:p-3 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
           <div className="flex items-center gap-2 overflow-x-auto pb-1 sm:pb-0 no-scrollbar">
             <span className="inline-flex items-center gap-1.5 text-xs font-black text-[#062959] pl-1 whitespace-nowrap shrink-0">
@@ -1353,37 +1376,49 @@ export default function App() {
               />
             </div>
 
-            {/* ==================== RIGHT COLUMN: AI STUDIO OR LIVE EDITOR PANEL ==================== */}
+            {/* ==================== RIGHT COLUMN: AI STUDIO / WORKSPACE / LIVE EDITOR ==================== */}
             <div className="w-full lg:w-[460px] shrink-0 flex flex-col gap-3">
-              {/* Desktop Mode Switcher between AI Studio and Graphic Editor */}
-              <div className="hidden lg:grid grid-cols-2 gap-1.5 p-1.5 bg-white border border-[#e3e9ed] rounded-2xl shadow-xs">
+              {/* Desktop 3-Way Switcher between AI Studio, Google Sheets/Drive, and Graphic Editor */}
+              <div className="hidden lg:grid grid-cols-3 gap-1 p-1.5 bg-white border border-[#e3e9ed] rounded-2xl shadow-xs">
                 <button
                   type="button"
                   onClick={() => setDesktopSideMode('ai-studio')}
-                  className={`flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-black transition-all cursor-pointer ${
+                  className={`flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl text-xs font-black transition-all cursor-pointer whitespace-nowrap ${
                     desktopSideMode === 'ai-studio'
                       ? 'bg-[#062959] text-[#14dac3] shadow-sm'
                       : 'text-[#233b53] hover:bg-[#f5f8fa]'
                   }`}
                 >
-                  <Sparkles className="w-4 h-4 shrink-0" />
-                  <span>هوش مصنوعی و سناریونویس آرکا</span>
+                  <Sparkles className="w-3.5 h-3.5 shrink-0" />
+                  <span>هوش مصنوعی آرکا</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDesktopSideMode('workspace')}
+                  className={`flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl text-xs font-black transition-all cursor-pointer whitespace-nowrap ${
+                    desktopSideMode === 'workspace'
+                      ? 'bg-[#062959] text-[#14dac3] shadow-sm'
+                      : 'text-[#233b53] hover:bg-[#f5f8fa]'
+                  }`}
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5 shrink-0" />
+                  <span>Sheets و Drive</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setDesktopSideMode('editor')}
-                  className={`flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-black transition-all cursor-pointer ${
+                  className={`flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl text-xs font-black transition-all cursor-pointer whitespace-nowrap ${
                     desktopSideMode === 'editor'
                       ? 'bg-[#062959] text-white shadow-sm'
                       : 'text-[#233b53] hover:bg-[#f5f8fa]'
                   }`}
                 >
-                  <SlidersHorizontal className="w-4 h-4 shrink-0" />
-                  <span>ویرایشگر دستی بوم و لوگو</span>
+                  <SlidersHorizontal className="w-3.5 h-3.5 shrink-0" />
+                  <span>ویرایشگر بوم</span>
                 </button>
               </div>
 
-              {/* AI Studio Panel (Visible on Desktop when desktopSideMode === 'ai-studio' OR on Mobile when mobileTab === 'ai-studio') */}
+              {/* 1. AI Studio Panel */}
               <div
                 className={
                   mobileTab === 'ai-studio'
@@ -1404,7 +1439,31 @@ export default function App() {
                 />
               </div>
 
-              {/* Live Graphic Editor Panel (Visible on Desktop when desktopSideMode === 'editor' OR on Mobile when mobileTab === 'editor') */}
+              {/* 2. Google Sheets & Google Drive Workspace Panel */}
+              <div
+                className={
+                  mobileTab === 'workspace'
+                    ? 'block'
+                    : desktopSideMode === 'workspace'
+                    ? 'hidden lg:block'
+                    : 'hidden'
+                }
+              >
+                <GoogleWorkspacePanel
+                  currentUser={currentUser}
+                  accessToken={accessToken}
+                  needsAuth={needsAuth}
+                  isSigningIn={isSigningIn}
+                  onGoogleSignIn={handleGoogleSignIn}
+                  activeStory={activeStory}
+                  allStories={stories}
+                  activeFormat={activeFormat}
+                  onUpdateStory={handleUpdateStory}
+                  onRenderCanvasToPngDataUrl={renderActiveCanvasToPngDataUrl}
+                />
+              </div>
+
+              {/* 3. Live Graphic Editor Panel */}
               <div
                 className={
                   mobileTab === 'editor'
@@ -1556,7 +1615,7 @@ export default function App() {
       {/* ==================== MOBILE & TABLET FIXED BOTTOM TAB BAR (< lg) ==================== */}
       <nav
         aria-label="ناوبری موبایل استودیو آرکا"
-        className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#062959]/95 backdrop-blur-md border-t border-[#0b2b56] grid grid-cols-4 items-center h-16 px-2 shadow-2xl"
+        className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#062959]/95 backdrop-blur-md border-t border-[#0b2b56] grid grid-cols-5 items-center h-16 px-1 shadow-2xl"
       >
         <button
           type="button"
@@ -1571,7 +1630,7 @@ export default function App() {
           }`}
         >
           <Eye className="w-5 h-5" />
-          <span className="text-[11px] mt-1 whitespace-nowrap">پیش‌نمایش بوم</span>
+          <span className="text-[10px] mt-1 whitespace-nowrap">پیش‌نمایش</span>
         </button>
 
         <button
@@ -1587,7 +1646,23 @@ export default function App() {
           }`}
         >
           <Sparkles className="w-5 h-5" />
-          <span className="text-[11px] mt-1 whitespace-nowrap">هوش مصنوعی آرکا</span>
+          <span className="text-[10px] mt-1 whitespace-nowrap">هوش مصنوعی</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => {
+            setViewMode('studio');
+            setMobileTab('workspace');
+          }}
+          className={`flex flex-col items-center justify-center min-h-[48px] rounded-xl transition-colors cursor-pointer ${
+            mobileTab === 'workspace' && viewMode === 'studio'
+              ? 'text-[#14dac3] font-black'
+              : 'text-slate-300 font-medium'
+          }`}
+        >
+          <FileSpreadsheet className="w-5 h-5" />
+          <span className="text-[10px] mt-1 whitespace-nowrap">Sheets/Drive</span>
         </button>
 
         <button
@@ -1603,7 +1678,7 @@ export default function App() {
           }`}
         >
           <SlidersHorizontal className="w-5 h-5" />
-          <span className="text-[11px] mt-1 whitespace-nowrap">ویرایشگر بوم</span>
+          <span className="text-[10px] mt-1 whitespace-nowrap">ویرایشگر</span>
         </button>
 
         <button
@@ -1618,7 +1693,7 @@ export default function App() {
           }`}
         >
           <LayoutGrid className="w-5 h-5" />
-          <span className="text-[11px] mt-1 whitespace-nowrap">گالری و دانلود</span>
+          <span className="text-[10px] mt-1 whitespace-nowrap">گالری</span>
         </button>
       </nav>
 
