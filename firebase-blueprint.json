@@ -1,0 +1,55 @@
+{
+  "entities": {
+    "AiGenerationRecord": {
+      "title": "AiGenerationRecord",
+      "description": "Stores AI-generated Instagram scenarios, slides, captions, and sales campaigns created by a signed-in Google user in the Arka Studio.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "mode": {
+          "type": "string",
+          "description": "AI generation mode",
+          "enum": ["canvas-slide", "carousel-deck", "reels-script", "campaign-plan"],
+          "minLength": 3,
+          "maxLength": 40
+        },
+        "productId": {
+          "type": "string",
+          "description": "Selected Arka product identifier from arka-acc.ir",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "title": {
+          "type": "string",
+          "description": "Human-readable title of the generated scenario or campaign",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "contentJson": {
+          "type": "string",
+          "description": "Serialized JSON payload of the generated AI content",
+          "minLength": 2,
+          "maxLength": 25000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the generation was saved"
+        }
+      },
+      "required": ["userId", "mode", "productId", "title", "contentJson", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/aiGenerations/{genId}": {
+      "schema": { "$ref": "#/entities/AiGenerationRecord" },
+      "description": "Private per-user collection of AI-generated Arka Instagram campaigns, Reels scripts, and slides."
+    }
+  }
+}

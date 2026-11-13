@@ -1,0 +1,71 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net: Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Primitive Helpers
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidAiGenerationRecord(data, userId) {
+      return data.keys().hasAll(['userId', 'mode', 'productId', 'title', 'contentJson', 'createdAt'])
+        && data.keys().hasOnly(['userId', 'mode', 'productId', 'title', 'contentJson', 'createdAt'])
+        && data.userId is string
+        && data.userId == userId
+        && data.userId == request.auth.uid
+        && data.userId.size() >= 1
+        && data.userId.size() <= 128
+        && data.userId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.mode is string
+        && data.mode in ['canvas-slide', 'carousel-deck', 'reels-script', 'campaign-plan']
+        && data.productId is string
+        && data.productId.size() >= 1
+        && data.productId.size() <= 100
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 300
+        && data.contentJson is string
+        && data.contentJson.size() >= 2
+        && data.contentJson.size() <= 25000
+        && data.createdAt is timestamp;
+    }
+
+    match /users/{userId}/aiGenerations/{genId} {
+      allow get: if isOwner(userId) && isValidId(userId) && isValidId(genId);
+      allow list: if isOwner(userId) && existing().userId == request.auth.uid;
+      allow create: if isOwner(userId)
+        && isValidId(userId)
+        && isValidId(genId)
+        && isValidAiGenerationRecord(incoming(), userId)
+        && incoming().createdAt == request.time;
+      allow update: if isOwner(userId)
+        && isValidId(userId)
+        && isValidId(genId)
+        && isValidAiGenerationRecord(incoming(), userId)
+        && incoming().userId == existing().userId
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'contentJson']);
+      allow delete: if isOwner(userId) && isValidId(userId) && isValidId(genId);
+    }
+  }
+}

@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: 'Vazirmatn';
+  src: url('/fonts/Vazirmatn-Variable.woff2') format('woff2 supports variations'),
+       url('/fonts/Vazirmatn-Variable.woff2') format('woff2-variations');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@layer base {
+  :root {
+    --font-sans: 'Vazirmatn', Tahoma, system-ui, -apple-system, sans-serif;
+    --arka-primary: #062959;
+    --arka-navy: #0b2b56;
+    --arka-accent: #08cdbd;
+    --arka-mint: #14dac3;
+    --arka-surface: #f5f8fa;
+    --arka-ink: #233b53;
+    --arka-border: #e3e9ed;
+    --arka-muted: #7e8c9b;
+  }
+
+  html, body {
+    font-family: 'Vazirmatn', Tahoma, system-ui, -apple-system, sans-serif;
+    font-feature-settings: "ss01";
+    color: #233b53;
+    background-color: #f5f8fa;
+  }
+}
+
+.tabular-nums-fa {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "ss01", "tnum";
+}
+
+.headline-balance {
+  text-wrap: balance;
+}
