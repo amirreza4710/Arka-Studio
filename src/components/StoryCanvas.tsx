@@ -1,4 +1,5 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { ArkaStoryData, CanvasFormatSpec } from '../data/arkaStories';
 import {
   CheckCircle2,
@@ -15,6 +16,7 @@ import {
 } from 'lucide-react';
 
 export type LogoDisplayMode = 'official-full' | 'official-badge' | 'custom';
+export type CanvasIsolationMode = 'standard' | 'iframe-isolated';
 
 export interface StoryCanvasMountEvent {
   mounted: boolean;
@@ -23,6 +25,10 @@ export interface StoryCanvasMountEvent {
   theme: string;
   width: number;
   height: number;
+  renderedBoundsWidth?: number;
+  renderedBoundsHeight?: number;
+  renderMode?: CanvasIsolationMode;
+  renderHealth?: 'healthy' | 'auto-recovered';
 }
 
 export interface StoryCanvasAssetEvent {
@@ -48,8 +54,10 @@ interface StoryCanvasProps {
   showSafeZoneGuides: boolean;
   showStickerPlaceholder: boolean;
   canvasRef?: React.RefObject<HTMLDivElement | null>;
+  renderMode?: CanvasIsolationMode;
   onCanvasMountChange?: (event: StoryCanvasMountEvent) => void;
   onAssetEvent?: (event: StoryCanvasAssetEvent) => void;
+  onContainerRenderFail?: () => void;
 }
 
 export const StoryCanvas: React.FC<StoryCanvasProps> = ({
@@ -62,8 +70,10 @@ export const StoryCanvas: React.FC<StoryCanvasProps> = ({
   showSafeZoneGuides,
   showStickerPlaceholder,
   canvasRef,
+  renderMode = 'standard',
   onCanvasMountChange,
   onAssetEvent,
+  onContainerRenderFail,
 }) => {
   const internalRef = useRef<HTMLDivElement | null>(null);
 
@@ -78,22 +88,82 @@ export const StoryCanvas: React.FC<StoryCanvasProps> = ({
   const isEmeraldBg = story.theme === 'emerald-tax';
 
   useEffect(() => {
-    if (!onCanvasMountChange) return;
-    onCanvasMountChange({
-      mounted: true,
-      storyId: story.id,
-      storyTitle: story.titleShort,
-      theme: story.theme,
-      width: canvasWidth,
-      height: canvasHeight,
-    });
+    const node = internalRef.current;
+    if (!node) return;
+
+    const emitTelemetry = (rectW: number, rectH: number, recovered = false) => {
+      if (!onCanvasMountChange) return;
+      onCanvasMountChange({
+        mounted: true,
+        storyId: story.id,
+        storyTitle: story.titleShort,
+        theme: story.theme,
+        width: canvasWidth,
+        height: canvasHeight,
+        renderedBoundsWidth: Math.round(rectW),
+        renderedBoundsHeight: Math.round(rectH),
+        renderMode,
+        renderHealth: recovered ? 'auto-recovered' : 'healthy',
+      });
+    };
+
+    const verifyBounds = () => {
+      const el = internalRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (
+        renderMode === 'standard' &&
+        (rect.width < 10 || rect.height < 10) &&
+        onContainerRenderFail
+      ) {
+        onContainerRenderFail();
+        emitTelemetry(rect.width, rect.height, true);
+      } else {
+        emitTelemetry(rect.width || canvasWidth, rect.height || canvasHeight, false);
+      }
+    };
+
+    const rafId = requestAnimationFrame(verifyBounds);
+
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          const { width, height } = entry.contentRect;
+          if (
+            renderMode === 'standard' &&
+            (width < 10 || height < 10) &&
+            onContainerRenderFail
+          ) {
+            onContainerRenderFail();
+          } else {
+            const rect = entry.target.getBoundingClientRect();
+            emitTelemetry(
+              rect.width || width || canvasWidth,
+              rect.height || height || canvasHeight,
+              false
+            );
+          }
+        }
+      });
+      resizeObserver.observe(node);
+    }
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      if (resizeObserver) {
+        resizeObserver.disconnect();
+      }
+    };
   }, [
     story.id,
     story.titleShort,
     story.theme,
     canvasWidth,
     canvasHeight,
+    renderMode,
     onCanvasMountChange,
+    onContainerRenderFail,
   ]);
 
   // Official arka-acc.ir palette:
@@ -1043,3 +1113,227 @@ export const StoryCanvas: React.FC<StoryCanvasProps> = ({
     </div>
   );
 };
+
+interface IsolatedStoryCanvasViewportProps {
+  story: ArkaStoryData;
+  formatSpec: CanvasFormatSpec;
+  carouselMeta?: CarouselSlideMeta;
+  logoMode: LogoDisplayMode;
+  customLogoUrl: string;
+  logoScale: number;
+  showSafeZoneGuides: boolean;
+  showStickerPlaceholder: boolean;
+  previewScale: number;
+  isolationMode: CanvasIsolationMode;
+  onSwitchIsolationMode: (mode: CanvasIsolationMode) => void;
+  onCanvasMountChange?: (event: StoryCanvasMountEvent) => void;
+  onAssetEvent?: (event: StoryCanvasAssetEvent) => void;
+}
+
+/**
+ * IsolatedStoryCanvasViewport:
+ * Supports both Standard Container CSS-Scale Rendering (monitored via ResizeObserver)
+ * and an Iframe-Style Isolation Mode (using a same-origin iframe + React Portal with
+ * cloned stylesheets and Vazirmatn fonts) that guarantees pixel-accurate rendering
+ * even if parent flex/grid containers encounter layout anomalies in Studio preview.
+ */
+export const IsolatedStoryCanvasViewport: React.FC<
+  IsolatedStoryCanvasViewportProps
+> = ({
+  story,
+  formatSpec,
+  carouselMeta,
+  logoMode,
+  customLogoUrl,
+  logoScale,
+  showSafeZoneGuides,
+  showStickerPlaceholder,
+  previewScale,
+  isolationMode,
+  onSwitchIsolationMode,
+  onCanvasMountChange,
+  onAssetEvent,
+}) => {
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const [iframeMountNode, setIframeMountNode] = useState<HTMLElement | null>(
+    null
+  );
+
+  const scaledWidth = Math.max(120, Math.round(formatSpec.width * previewScale));
+  const scaledHeight = Math.max(
+    120,
+    Math.round(formatSpec.height * previewScale)
+  );
+
+  const syncHostStylesIntoIframe = useCallback((doc: Document) => {
+    doc.documentElement.dir = 'rtl';
+    doc.documentElement.lang = 'fa';
+    doc.head.innerHTML = '';
+
+    // Copy all <link rel="stylesheet"> and <style> elements from main document head
+    const styleNodes = document.head.querySelectorAll(
+      'style, link[rel="stylesheet"], link[href*="Vazirmatn"]'
+    );
+    styleNodes.forEach((node) => {
+      doc.head.appendChild(node.cloneNode(true));
+    });
+
+    const baseReset = doc.createElement('style');
+    baseReset.textContent = `
+      html, body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #062959;
+        font-family: 'Vazirmatn', Tahoma, system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      .tabular-nums-fa {
+        font-variant-numeric: tabular-nums;
+      }
+    `;
+    doc.head.appendChild(baseReset);
+  }, []);
+
+  useEffect(() => {
+    if (isolationMode !== 'iframe-isolated') {
+      setIframeMountNode(null);
+      return;
+    }
+
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+
+    const setupIframePortal = () => {
+      const doc = iframe.contentDocument;
+      if (!doc || !doc.body) return;
+
+      syncHostStylesIntoIframe(doc);
+      let rootEl = doc.getElementById('arka-isolated-canvas-root');
+      if (!rootEl) {
+        rootEl = doc.createElement('div');
+        rootEl.id = 'arka-isolated-canvas-root';
+        doc.body.innerHTML = '';
+        doc.body.appendChild(rootEl);
+      }
+      setIframeMountNode(rootEl);
+    };
+
+    if (iframe.contentDocument?.readyState === 'complete') {
+      setupIframePortal();
+    } else {
+      iframe.addEventListener('load', setupIframePortal);
+      return () => iframe.removeEventListener('load', setupIframePortal);
+    }
+  }, [isolationMode, syncHostStylesIntoIframe]);
+
+  // Also observe <style> additions in document.head while in iframe mode (e.g., Vite style injection)
+  useEffect(() => {
+    if (isolationMode !== 'iframe-isolated') return;
+    const iframe = iframeRef.current;
+    if (!iframe?.contentDocument) return;
+
+    const headObserver = new MutationObserver(() => {
+      if (iframe.contentDocument) {
+        syncHostStylesIntoIframe(iframe.contentDocument);
+      }
+    });
+    headObserver.observe(document.head, { childList: true, subtree: true });
+    return () => headObserver.disconnect();
+  }, [isolationMode, syncHostStylesIntoIframe]);
+
+  const handleContainerRenderFail = useCallback(() => {
+    if (isolationMode === 'standard') {
+      onSwitchIsolationMode('iframe-isolated');
+    }
+  }, [isolationMode, onSwitchIsolationMode]);
+
+  if (isolationMode === 'iframe-isolated') {
+    return (
+      <div
+        className="overflow-hidden rounded-[22px] shadow-2xl border-2 border-[#14dac3] relative bg-[#062959] mx-auto"
+        style={{
+          width: `${scaledWidth}px`,
+          height: `${scaledHeight}px`,
+        }}
+      >
+        <iframe
+          ref={iframeRef}
+          title="پیش‌نمایش ایزوله بوم آرکا"
+          className="w-full h-full border-0 block bg-[#062959]"
+          style={{
+            width: `${scaledWidth}px`,
+            height: `${scaledHeight}px`,
+          }}
+        />
+        {iframeMountNode &&
+          createPortal(
+            <div
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                transform: `scale(${previewScale})`,
+                transformOrigin: 'top left',
+                width: `${formatSpec.width}px`,
+                height: `${formatSpec.height}px`,
+              }}
+            >
+              <StoryCanvas
+                story={story}
+                formatSpec={formatSpec}
+                carouselMeta={carouselMeta}
+                logoMode={logoMode}
+                customLogoUrl={customLogoUrl}
+                logoScale={logoScale}
+                showSafeZoneGuides={showSafeZoneGuides}
+                showStickerPlaceholder={showStickerPlaceholder}
+                renderMode="iframe-isolated"
+                onCanvasMountChange={onCanvasMountChange}
+                onAssetEvent={onAssetEvent}
+              />
+            </div>,
+            iframeMountNode
+          )}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="overflow-hidden rounded-[22px] shadow-2xl border-2 border-[#08cdbd]/40 relative bg-[#062959] mx-auto"
+      style={{
+        width: `${scaledWidth}px`,
+        height: `${scaledHeight}px`,
+      }}
+    >
+      <div
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          transform: `scale(${previewScale})`,
+          transformOrigin: 'top left',
+          width: `${formatSpec.width}px`,
+          height: `${formatSpec.height}px`,
+        }}
+      >
+        <StoryCanvas
+          story={story}
+          formatSpec={formatSpec}
+          carouselMeta={carouselMeta}
+          logoMode={logoMode}
+          customLogoUrl={customLogoUrl}
+          logoScale={logoScale}
+          showSafeZoneGuides={showSafeZoneGuides}
+          showStickerPlaceholder={showStickerPlaceholder}
+          renderMode="standard"
+          onCanvasMountChange={onCanvasMountChange}
+          onAssetEvent={onAssetEvent}
+          onContainerRenderFail={handleContainerRenderFail}
+        />
+      </div>
+    </div>
+  );
+};
+

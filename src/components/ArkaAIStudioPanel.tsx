@@ -11,12 +11,17 @@ import {
   saveUserAiGeneration,
   fetchUserAiGenerations,
   deleteUserAiGeneration,
+  getAccessToken,
 } from '../firebase';
 import {
   Sparkles,
   Film,
   Layers,
   CalendarRange,
+  CalendarDays,
+  FileSpreadsheet,
+  ExternalLink,
+  ShieldAlert,
   Wand2,
   RefreshCw,
   Copy,
@@ -30,6 +35,29 @@ import {
   CheckCircle2,
   AlertCircle,
 } from 'lucide-react';
+
+export interface Generated30DayScheduleItem {
+  dayNumber: number;
+  launchPhase: string;
+  productModule: string;
+  formatRecommended: string;
+  categoryLabel: string;
+  eyebrow: string;
+  headlinePart1: string;
+  headlineHighlight: string;
+  headlinePart2: string;
+  leadCopy: string;
+  primaryStatValue: string;
+  primaryStatLabel: string;
+  ctaAction: string;
+  captionSummary: string;
+}
+
+export interface Generated30DayCalendarResult {
+  calendarTitle: string;
+  launchCycleSummary: string;
+  scheduleDays: Generated30DayScheduleItem[];
+}
 
 interface GeneratedSlidePayload {
   categoryLabel: string;
@@ -56,6 +84,8 @@ interface GeneratedSlidePayload {
 
 interface ArkaAIStudioPanelProps {
   currentUser: User | null;
+  accessToken?: string | null;
+  needsAuth?: boolean;
   isSigningIn: boolean;
   onGoogleSignIn: () => void;
   onGoogleSignOut: () => void;
@@ -65,18 +95,26 @@ interface ArkaAIStudioPanelProps {
     captionText?: string
   ) => void;
   onInjectCarouselDeckIntoStudio: (deck: ArkaCarouselDeck) => void;
+  onCalendarSavedToDrive?: (spreadsheetInfo: {
+    spreadsheetId: string;
+    spreadsheetUrl: string;
+    title: string;
+  }) => void;
 }
 
 export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
   currentUser,
+  accessToken,
+  needsAuth,
   isSigningIn,
   onGoogleSignIn,
   onGoogleSignOut,
   activeStory,
   onInjectSlideIntoCanvas,
   onInjectCarouselDeckIntoStudio,
+  onCalendarSavedToDrive,
 }) => {
-  const [mode, setMode] = useState<AiGenMode>('reels-script');
+  const [mode, setMode] = useState<AiGenMode>('campaign-calendar-30');
   const [selectedProductId, setSelectedProductId] = useState<string>(
     ARKA_SITE_CATALOG[0].id
   );
@@ -106,6 +144,17 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
   // Cloud saved generations for logged-in Gmail user
   const [savedHistory, setSavedHistory] = useState<SavedAiGenerationItem[]>([]);
   const [showHistory, setShowHistory] = useState<boolean>(false);
+
+  // 30-Day AI Campaign Calendar filter & Google Drive Spreadsheet export state
+  const [selectedWeekFilter, setSelectedWeekFilter] = useState<number>(0); // 0 = All 30 days, 1..4 = Week 1..4
+  const [isConfirmingDriveSave, setIsConfirmingDriveSave] =
+    useState<boolean>(false);
+  const [isSavingToDrive, setIsSavingToDrive] = useState<boolean>(false);
+  const [savedDriveSheetInfo, setSavedDriveSheetInfo] = useState<{
+    spreadsheetId: string;
+    spreadsheetUrl: string;
+    title: string;
+  } | null>(null);
 
   const selectedProduct =
     ARKA_SITE_CATALOG.find((p) => p.id === selectedProductId) ||
@@ -201,10 +250,12 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
       }
 
       setAiResult(data.result);
+      setSavedDriveSheetInfo(null);
 
       // Automatically save to the signed-in Gmail user's cloud history
       if (currentUser && data.result) {
         const title =
+          data.result.calendarTitle ||
           data.result.scenarioTitle ||
           data.result.deckTitle ||
           data.result.campaignName ||
@@ -289,6 +340,179 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     };
 
     onInjectCarouselDeckIntoStudio(newDeck);
+  };
+
+  // Inject any day from the 30-Day AI Campaign Calendar directly into the live StoryCanvas
+  const handleInjectCalendarDayIntoCanvas = (day: Generated30DayScheduleItem) => {
+    const slidePayload: GeneratedSlidePayload = {
+      categoryLabel:
+        day.categoryLabel || `روز ${day.dayNumber} · ${day.productModule}`,
+      headerMeta: `تقویم ۳۰ روزه آرکا · ${day.launchPhase}`,
+      eyebrow: day.eyebrow || day.productModule,
+      headlinePart1: day.headlinePart1 || '',
+      headlineHighlight: day.headlineHighlight || day.productModule,
+      headlinePart2: day.headlinePart2 || '',
+      leadCopy: day.leadCopy || '',
+      primaryStatValue: day.primaryStatValue || '۱۰۰ سند دمو',
+      primaryStatLabel:
+        day.primaryStatLabel || 'تست رایگان در https://arka-acc.ir/demo',
+      secondaryBannerTitle: '+ ۱ سال پشتیبانی رایگان آرکا',
+      secondaryBannerSub: `${day.productModule} · ${day.launchPhase}`,
+      stickerTitle: `روز ${day.dayNumber}: دریافت دموی رایگان ۱۰۰ سند`,
+      stickerActionText: day.ctaAction || 'https://arka-acc.ir/demo',
+      instagramCaption: day.captionSummary || '',
+      items: activeStory.items.map((it, idx) =>
+        idx === 0
+          ? {
+              kicker: `روز ${day.dayNumber} تقویم`,
+              title: day.productModule,
+              subtitle: day.launchPhase,
+              metric: day.formatRecommended || 'آرکا',
+            }
+          : {
+              kicker: it.kicker,
+              title: it.title,
+              subtitle: it.subtitle,
+              metric: it.metric || 'آرکا',
+            }
+      ),
+    };
+
+    onInjectSlideIntoCanvas(slidePayload, day.captionSummary);
+  };
+
+  // Execute Google Drive Spreadsheet creation for the 30-Day AI Campaign Calendar (after user confirmation)
+  const executeSave30DayCalendarToDrive = async () => {
+    if (!aiResult?.scheduleDays || !Array.isArray(aiResult.scheduleDays)) return;
+    setIsConfirmingDriveSave(false);
+
+    const token = accessToken || (await getAccessToken());
+    if (!token || needsAuth) {
+      onGoogleSignIn();
+      return;
+    }
+
+    setIsSavingToDrive(true);
+    setErrorMsg(null);
+
+    try {
+      const sheetTitle =
+        aiResult.calendarTitle ||
+        `تقویم ۳۰ روزه کمپین اینستاگرام آرکا - ${selectedProduct.name}`;
+      const desiredTabName = 'تقویم_۳۰_روزه_آرکا';
+
+      const createRes = await fetch(
+        'https://sheets.googleapis.com/v4/spreadsheets',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            properties: {
+              title: sheetTitle,
+            },
+            sheets: [
+              {
+                properties: {
+                  title: desiredTabName,
+                  rightToLeft: true,
+                },
+              },
+            ],
+          }),
+        }
+      );
+
+      if (!createRes.ok) {
+        throw new Error(
+          'خطا در ایجاد فایل Spreadsheet در Google Drive. لطفاً اتصال حساب گوگل خود را بررسی کنید.'
+        );
+      }
+
+      const createdSheet = await createRes.json();
+      const spreadsheetId: string = createdSheet.spreadsheetId;
+      const spreadsheetUrl: string =
+        createdSheet.spreadsheetUrl ||
+        `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+
+      // Discover actual sheet tab title dynamically from the creation response (never hardcode Sheet1)
+      const actualTabTitle: string =
+        createdSheet.sheets?.[0]?.properties?.title || desiredTabName;
+
+      const headerRow = [
+        'روز تقویم',
+        'فاز چرخه محصول (Launch Cycle)',
+        'محصول / سرویس سایت آرکا',
+        'فرمت پیشنهادی',
+        'دسته‌بندی بوم',
+        'روتیتر (Eyebrow)',
+        'تیتر اصلی',
+        'کلمه کلیدی رنگی (Highlight)',
+        'توضیح زیر تیتر (Lead Copy)',
+        'شاخص کلیدی',
+        'دعوت به اقدام (CTA)',
+        'کپشن و سناریوی آماده انتشار',
+      ];
+
+      const scheduleRows = (
+        aiResult.scheduleDays as Generated30DayScheduleItem[]
+      ).map((d) => [
+        `روز ${d.dayNumber}`,
+        d.launchPhase,
+        d.productModule,
+        d.formatRecommended,
+        d.categoryLabel,
+        d.eyebrow,
+        `${d.headlinePart1} ${d.headlineHighlight} ${d.headlinePart2}`.trim(),
+        d.headlineHighlight,
+        d.leadCopy,
+        `${d.primaryStatValue} (${d.primaryStatLabel})`,
+        d.ctaAction,
+        d.captionSummary,
+      ]);
+
+      const encodedRange = encodeURIComponent(
+        `'${actualTabTitle}'!A1:L${scheduleRows.length + 1}`
+      );
+
+      const writeRes = await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodedRange}?valueInputOption=USER_ENTERED`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            values: [headerRow, ...scheduleRows],
+          }),
+        }
+      );
+
+      if (!writeRes.ok) {
+        throw new Error(
+          'فایل Spreadsheet ساخته شد اما در نوشتن ردیف‌های ۳۰ روزه خطایی رخ داد.'
+        );
+      }
+
+      const savedInfo = {
+        spreadsheetId,
+        spreadsheetUrl,
+        title: sheetTitle,
+      };
+      setSavedDriveSheetInfo(savedInfo);
+      if (onCalendarSavedToDrive) {
+        onCalendarSavedToDrive(savedInfo);
+      }
+    } catch (err: any) {
+      setErrorMsg(
+        err?.message || 'خطا در ذخیره تقویم ۳۰ روزه در Google Drive.'
+      );
+    } finally {
+      setIsSavingToDrive(false);
+    }
   };
 
   return (
@@ -417,71 +641,89 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
         </div>
       </div>
 
-      {/* 4 AI Mode Selector Tabs */}
-      <div className="p-2 bg-[#f5f8fa] border-b border-[#e3e9ed] grid grid-cols-2 sm:grid-cols-4 gap-1">
+      {/* 5 AI Mode Selector Tabs (Including 30-Day AI Campaign Calendar) */}
+      <div className="p-2 bg-[#f5f8fa] border-b border-[#e3e9ed] flex flex-col gap-1.5">
         <button
           type="button"
           onClick={() => {
-            setMode('reels-script');
+            setMode('campaign-calendar-30');
             setShowHistory(false);
           }}
-          className={`flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[42px] ${
-            mode === 'reels-script' && !showHistory
-              ? 'bg-[#062959] text-white shadow-xs'
-              : 'text-[#233b53] hover:bg-white'
+          className={`w-full flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-black transition-colors cursor-pointer min-h-[42px] border ${
+            mode === 'campaign-calendar-30' && !showHistory
+              ? 'bg-[#062959] text-[#14dac3] border-[#08cdbd] shadow-xs'
+              : 'bg-white text-[#062959] border-[#08cdbd]/50 hover:bg-[#e5fbf9]'
           }`}
         >
-          <Film className="w-3.5 h-3.5 shrink-0" />
-          <span>سناریو ریلز/موشن</span>
+          <CalendarDays className="w-4 h-4 shrink-0 text-[#08cdbd]" />
+          <span>تقویم کمپین ۳۰ روزه آرکا + ذخیره در Google Drive</span>
         </button>
 
-        <button
-          type="button"
-          onClick={() => {
-            setMode('canvas-slide');
-            setShowHistory(false);
-          }}
-          className={`flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[42px] ${
-            mode === 'canvas-slide' && !showHistory
-              ? 'bg-[#062959] text-white shadow-xs'
-              : 'text-[#233b53] hover:bg-white'
-          }`}
-        >
-          <Wand2 className="w-3.5 h-3.5 shrink-0" />
-          <span>محتوای بوم/پست</span>
-        </button>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-1">
+          <button
+            type="button"
+            onClick={() => {
+              setMode('reels-script');
+              setShowHistory(false);
+            }}
+            className={`flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[38px] ${
+              mode === 'reels-script' && !showHistory
+                ? 'bg-[#062959] text-white shadow-xs'
+                : 'text-[#233b53] hover:bg-white'
+            }`}
+          >
+            <Film className="w-3.5 h-3.5 shrink-0" />
+            <span>سناریو ریلز/موشن</span>
+          </button>
 
-        <button
-          type="button"
-          onClick={() => {
-            setMode('carousel-deck');
-            setShowHistory(false);
-          }}
-          className={`flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[42px] ${
-            mode === 'carousel-deck' && !showHistory
-              ? 'bg-[#062959] text-white shadow-xs'
-              : 'text-[#233b53] hover:bg-white'
-          }`}
-        >
-          <Layers className="w-3.5 h-3.5 shrink-0" />
-          <span>کاروسل ۵ اسلایدی</span>
-        </button>
+          <button
+            type="button"
+            onClick={() => {
+              setMode('canvas-slide');
+              setShowHistory(false);
+            }}
+            className={`flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[38px] ${
+              mode === 'canvas-slide' && !showHistory
+                ? 'bg-[#062959] text-white shadow-xs'
+                : 'text-[#233b53] hover:bg-white'
+            }`}
+          >
+            <Wand2 className="w-3.5 h-3.5 shrink-0" />
+            <span>محتوای بوم/پست</span>
+          </button>
 
-        <button
-          type="button"
-          onClick={() => {
-            setMode('campaign-plan');
-            setShowHistory(false);
-          }}
-          className={`flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[42px] ${
-            mode === 'campaign-plan' && !showHistory
-              ? 'bg-[#062959] text-white shadow-xs'
-              : 'text-[#233b53] hover:bg-white'
-          }`}
-        >
-          <CalendarRange className="w-3.5 h-3.5 shrink-0" />
-          <span>کمپین و تقویم</span>
-        </button>
+          <button
+            type="button"
+            onClick={() => {
+              setMode('carousel-deck');
+              setShowHistory(false);
+            }}
+            className={`flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[38px] ${
+              mode === 'carousel-deck' && !showHistory
+                ? 'bg-[#062959] text-white shadow-xs'
+                : 'text-[#233b53] hover:bg-white'
+            }`}
+          >
+            <Layers className="w-3.5 h-3.5 shrink-0" />
+            <span>کاروسل ۵ اسلایدی</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setMode('campaign-plan');
+              setShowHistory(false);
+            }}
+            className={`flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[38px] ${
+              mode === 'campaign-plan' && !showHistory
+                ? 'bg-[#062959] text-white shadow-xs'
+                : 'text-[#233b53] hover:bg-white'
+            }`}
+          >
+            <CalendarRange className="w-3.5 h-3.5 shrink-0" />
+            <span>کمپین ۵ روزه</span>
+          </button>
+        </div>
       </div>
 
       {/* Main Scrollable Content Area */}
@@ -522,7 +764,9 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                         {item.title}
                       </div>
                       <div className="text-[11px] text-[#7e8c9b] mt-0.5">
-                        {item.mode === 'reels-script'
+                        {item.mode === 'campaign-calendar-30'
+                          ? 'تقویم کمپین ۳۰ روزه چرخه محصولات'
+                          : item.mode === 'reels-script'
                           ? 'سناریوی ریلز و موشن'
                           : item.mode === 'carousel-deck'
                           ? 'کاروسل ۵ اسلایدی'
@@ -681,7 +925,9 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                   <>
                     <Sparkles className="w-4 h-4" />
                     <span>
-                      {mode === 'reels-script'
+                      {mode === 'campaign-calendar-30'
+                        ? 'تولید تقویم ۳۰ روزه چرخه محصولات آرکا (AI Campaign Calendar)'
+                        : mode === 'reels-script'
                         ? 'تولید سناریوی ریلز، ویدیو و موشن‌گرافی + کاور'
                         : mode === 'carousel-deck'
                         ? 'تولید کاروسل ۵ اسلایدی به‌هم‌پیوسته + کپشن'
@@ -1006,11 +1252,243 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                     </div>
                   </div>
                 )}
+
+                {/* 5. 30-DAY AI CAMPAIGN CALENDAR + SAVE TO GOOGLE DRIVE SPREADSHEET */}
+                {mode === 'campaign-calendar-30' &&
+                  aiResult.scheduleDays &&
+                  Array.isArray(aiResult.scheduleDays) && (
+                    <div className="space-y-4">
+                      {/* Summary Header + Save as Google Drive Spreadsheet CTA */}
+                      <div className="p-4 rounded-2xl bg-[#062959] text-white space-y-3 border border-[#08cdbd]/40">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[11px] font-bold text-[#14dac3]">
+                            تقویم ۳۰ روزه منطبق با چرخه محصولات arka-acc.ir (
+                            {aiResult.scheduleDays.length} روز)
+                          </span>
+                        </div>
+                        <h3 className="text-sm font-black text-white">
+                          {aiResult.calendarTitle}
+                        </h3>
+                        <p className="text-xs text-slate-200 leading-relaxed">
+                          {aiResult.launchCycleSummary}
+                        </p>
+
+                        {/* Save to Google Drive as Spreadsheet Button */}
+                        <div className="pt-1 space-y-2">
+                          <button
+                            type="button"
+                            disabled={isSavingToDrive}
+                            onClick={() => {
+                              if (!accessToken || needsAuth) {
+                                onGoogleSignIn();
+                              } else {
+                                setIsConfirmingDriveSave(true);
+                              }
+                            }}
+                            className="w-full py-2.5 px-4 rounded-xl bg-[#08cdbd] hover:bg-[#14dac3] disabled:opacity-60 text-[#062959] font-black text-xs flex items-center justify-center gap-2 cursor-pointer shadow-sm min-h-[42px]"
+                          >
+                            {isSavingToDrive ? (
+                              <>
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                <span>
+                                  در حال ساخت فایل Spreadsheet در Google Drive...
+                                </span>
+                              </>
+                            ) : (
+                              <>
+                                <FileSpreadsheet className="w-4 h-4 shrink-0" />
+                                <span>
+                                  {!accessToken || needsAuth
+                                    ? 'ورود با گوگل و ذخیره تقویم ۳۰ روزه در Google Drive'
+                                    : 'ذخیره تقویم ۳۰ روزه در Google Drive (Spreadsheet)'}
+                                </span>
+                              </>
+                            )}
+                          </button>
+
+                          {savedDriveSheetInfo && (
+                            <div className="p-3 rounded-xl bg-[#0b2b56] border border-[#14dac3] flex items-center justify-between gap-2 text-xs">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <CheckCircle2 className="w-4 h-4 text-[#14dac3] shrink-0" />
+                                <span className="truncate font-bold text-white">
+                                  ذخیره شد: {savedDriveSheetInfo.title}
+                                </span>
+                              </div>
+                              <a
+                                href={savedDriveSheetInfo.spreadsheetUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#08cdbd] text-[#062959] font-black text-[11px] shrink-0"
+                              >
+                                <span>باز کردن در Drive</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* 4-Week Product Launch Cycle Filter Bar */}
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {[
+                          { id: 0, label: 'همه ۳۰ روز' },
+                          { id: 1, label: 'هفته ۱ (آگاهی و مؤدیان)' },
+                          { id: 2, label: 'هفته ۲ (۸ محصول تخصصی)' },
+                          { id: 3, label: 'هفته ۳ (اثبات و هوش مصنوعی)' },
+                          { id: 4, label: 'هفته ۴ (دموی ۱۰۰ سند و فروش)' },
+                        ].map((wk) => (
+                          <button
+                            key={wk.id}
+                            type="button"
+                            onClick={() => setSelectedWeekFilter(wk.id)}
+                            className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold border transition-colors cursor-pointer ${
+                              selectedWeekFilter === wk.id
+                                ? 'bg-[#062959] text-white border-[#062959]'
+                                : 'bg-[#f5f8fa] text-[#233b53] border-[#e3e9ed] hover:border-[#08cdbd]'
+                            }`}
+                          >
+                            {wk.label}
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* 30-Day Schedule Cards with 1-Click Canvas Injection */}
+                      <div className="space-y-2.5 max-h-[420px] overflow-y-auto pr-1">
+                        {(
+                          aiResult.scheduleDays as Generated30DayScheduleItem[]
+                        )
+                          .filter((d) => {
+                            if (selectedWeekFilter === 1)
+                              return d.dayNumber >= 1 && d.dayNumber <= 7;
+                            if (selectedWeekFilter === 2)
+                              return d.dayNumber >= 8 && d.dayNumber <= 15;
+                            if (selectedWeekFilter === 3)
+                              return d.dayNumber >= 16 && d.dayNumber <= 23;
+                            if (selectedWeekFilter === 4)
+                              return d.dayNumber >= 24 && d.dayNumber <= 30;
+                            return true;
+                          })
+                          .map((day, idx) => (
+                            <div
+                              key={`${day.dayNumber}-${idx}`}
+                              className="p-3.5 rounded-xl bg-[#f5f8fa] border border-[#e3e9ed] space-y-2 text-xs"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="px-2 py-0.5 rounded-md bg-[#062959] text-[#14dac3] font-black text-[11px] tabular-nums-fa">
+                                    روز {day.dayNumber}
+                                  </span>
+                                  <span className="font-bold text-[#089f93] truncate">
+                                    {day.productModule}
+                                  </span>
+                                </div>
+                                <span className="text-[11px] font-bold text-[#7e8c9b]">
+                                  {day.formatRecommended}
+                                </span>
+                              </div>
+
+                              <div className="text-[11px] font-semibold text-[#7e8c9b]">
+                                {day.launchPhase} · {day.eyebrow}
+                              </div>
+
+                              <div className="font-black text-[#062959] leading-snug">
+                                {day.headlinePart1}{' '}
+                                <span className="text-[#089f93]">
+                                  {day.headlineHighlight}
+                                </span>{' '}
+                                {day.headlinePart2}
+                              </div>
+
+                              <p className="text-[#233b53] leading-relaxed text-[11px]">
+                                {day.leadCopy}
+                              </p>
+
+                              <div className="pt-2 border-t border-[#e3e9ed] flex items-center justify-between gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleInjectCalendarDayIntoCanvas(day)
+                                  }
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#062959] hover:bg-[#0b2b56] text-white text-[11px] font-bold cursor-pointer"
+                                >
+                                  <ArrowUpRight className="w-3.5 h-3.5 text-[#14dac3]" />
+                                  <span>اعمال مستقیم روی بوم طراحی</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleCopy(
+                                      `${day.headlinePart1} ${day.headlineHighlight} ${day.headlinePart2}\n\n${day.captionSummary}`,
+                                      `cal30-${day.dayNumber}`
+                                    )
+                                  }
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white border border-[#e3e9ed] text-[11px] font-bold text-[#062959] cursor-pointer"
+                                >
+                                  {copiedKey === `cal30-${day.dayNumber}` ? (
+                                    <Check className="w-3.5 h-3.5 text-[#089f93]" />
+                                  ) : (
+                                    <Copy className="w-3.5 h-3.5" />
+                                  )}
+                                  <span>
+                                    {copiedKey === `cal30-${day.dayNumber}`
+                                      ? 'کپی شد'
+                                      : 'کپی کپشن'}
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                      </div>
+                    </div>
+                  )}
               </div>
             )}
           </>
         )}
       </div>
+
+      {/* Mandatory User Confirmation Dialog before Creating/Writing Spreadsheet in Google Drive */}
+      {isConfirmingDriveSave && aiResult?.scheduleDays && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white border border-[#e3e9ed] rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4 text-right">
+            <div className="flex items-center gap-2.5 text-[#062959]">
+              <div className="w-10 h-10 rounded-xl bg-[#e5fbf9] text-[#089f93] flex items-center justify-center shrink-0">
+                <ShieldAlert className="w-5 h-5" />
+              </div>
+              <h3 className="text-sm font-black">
+                تایید ذخیره تقویم ۳۰ روزه در Google Drive
+              </h3>
+            </div>
+
+            <p className="text-xs text-[#233b53] leading-relaxed">
+              آیا مایل هستید تقویم ۳۰ روزه «
+              <strong>{aiResult.calendarTitle}</strong>» شامل{' '}
+              {aiResult.scheduleDays.length} ردیف برنامه انتشار استوری و پست
+              به‌عنوان یک فایل جدید Google Sheets در حساب Google Drive شما ایجاد
+              و ذخیره شود؟
+            </p>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#e3e9ed]">
+              <button
+                type="button"
+                onClick={() => setIsConfirmingDriveSave(false)}
+                className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-xs font-bold text-[#233b53] cursor-pointer"
+              >
+                انصراف
+              </button>
+              <button
+                type="button"
+                onClick={executeSave30DayCalendarToDrive}
+                className="px-4 py-2 rounded-xl bg-[#062959] hover:bg-[#0b2b56] text-xs font-black text-white cursor-pointer"
+              >
+                بله، ایجاد Spreadsheet در Google Drive
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </aside>
   );
 };
+

@@ -192,7 +192,8 @@ export type AiGenMode =
   | 'canvas-slide'
   | 'carousel-deck'
   | 'reels-script'
-  | 'campaign-plan';
+  | 'campaign-plan'
+  | 'campaign-calendar-30';
 
 export interface SavedAiGenerationItem {
   id: string;
@@ -220,7 +221,7 @@ export async function saveUserAiGeneration(params: {
   const path = `users/${currentUser.uid}/aiGenerations/${genId}`;
 
   const safeTitle = (params.title || 'محتوای هوشمند آرکا').slice(0, 290);
-  const serialized = JSON.stringify(params.contentObj).slice(0, 24500);
+  const serialized = JSON.stringify(params.contentObj).slice(0, 58000);
   const safeProductId = (params.productId || 'arka-comprehensive').slice(0, 95);
 
   try {

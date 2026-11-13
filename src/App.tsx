@@ -23,6 +23,8 @@ import {
 } from './data/campaignPresets';
 import {
   StoryCanvas,
+  IsolatedStoryCanvasViewport,
+  CanvasIsolationMode,
   LogoDisplayMode,
   StoryCanvasMountEvent,
   StoryCanvasAssetEvent,
@@ -169,6 +171,9 @@ export default function App() {
   const [previewScale, setPreviewScale] = useState<number>(
     activeFormat.defaultPreviewScale
   );
+  const [autoFitScale, setAutoFitScale] = useState<boolean>(true);
+  const [isolationMode, setIsolationMode] =
+    useState<CanvasIsolationMode>('standard');
   const stageContainerRef = useRef<HTMLDivElement | null>(null);
 
   // Google Auth + Workspace OAuth Token State
@@ -265,19 +270,28 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // Responsive ResizeObserver for dynamic container scale calculation
+  // Robust ResizeObserver for dynamic container scale calculation
   useEffect(() => {
+    if (!autoFitScale) return;
+
     const node = stageContainerRef.current;
     const computeScale = (containerWidth: number) => {
-      if (containerWidth > 0 && containerWidth < 680) {
-        const availableWidth = Math.max(250, containerWidth - 36);
-        const fitScale = +(availableWidth / activeFormat.width).toFixed(2);
-        setPreviewScale(
-          Math.min(activeFormat.defaultPreviewScale, Math.max(0.24, fitScale))
-        );
-      } else {
-        setPreviewScale(activeFormat.defaultPreviewScale);
-      }
+      if (containerWidth <= 0) return;
+      const horizontalPadding = containerWidth < 640 ? 32 : 64;
+      const availableWidth = Math.max(240, containerWidth - horizontalPadding);
+      const widthScale = availableWidth / activeFormat.width;
+
+      // Also bound by viewport height so tall 9:16 stories fit comfortably
+      const maxStageHeight = Math.max(460, window.innerHeight - 250);
+      const heightScale = maxStageHeight / activeFormat.height;
+
+      const optimalScale = +Math.min(
+        activeFormat.defaultPreviewScale,
+        widthScale,
+        Math.max(0.28, heightScale)
+      ).toFixed(2);
+
+      setPreviewScale(Math.max(0.22, Math.min(0.65, optimalScale)));
     };
 
     if (node && typeof ResizeObserver !== 'undefined') {
@@ -287,11 +301,12 @@ export default function App() {
         }
       });
       observer.observe(node);
+      computeScale(node.getBoundingClientRect().width || window.innerWidth);
       return () => observer.disconnect();
     } else {
       computeScale(window.innerWidth);
     }
-  }, [activeFormat]);
+  }, [activeFormat, autoFitScale]);
 
   useEffect(() => {
     try {
@@ -1299,14 +1314,53 @@ export default function App() {
                     </button>
                   </div>
 
-                  {/* Zoom Controls */}
-                  <div className="flex items-center gap-1.5">
+                  {/* Zoom & Isolation Mode Controls */}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {/* Iframe-Style Isolation Mode Toggle */}
                     <button
                       type="button"
                       onClick={() =>
-                        setPreviewScale((s) => Math.max(0.22, +(s - 0.04).toFixed(2)))
+                        setIsolationMode((m) =>
+                          m === 'standard' ? 'iframe-isolated' : 'standard'
+                        )
                       }
-                      className="p-2 rounded-lg bg-[#0b2b56] border border-white/15 text-slate-200 hover:text-white cursor-pointer min-h-[40px] min-w-[40px] flex items-center justify-center"
+                      className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-bold transition-colors cursor-pointer min-h-[38px] flex items-center gap-1.5 ${
+                        isolationMode === 'iframe-isolated'
+                          ? 'bg-[#08cdbd] text-[#062959] border-[#08cdbd] font-black'
+                          : 'bg-[#0b2b56] text-slate-200 border-white/15 hover:text-white'
+                      }`}
+                      title="ایزوله‌سازی کامل بوم در یک Iframe مستقل در صورت تداخل استایل یا ابعاد کانتینر"
+                    >
+                      <span>
+                        {isolationMode === 'iframe-isolated'
+                          ? 'حالت ایزوله Iframe: فعال'
+                          : 'حالت ایزوله Iframe'}
+                      </span>
+                    </button>
+
+                    {/* Auto-Fit ResizeObserver Toggle */}
+                    <button
+                      type="button"
+                      onClick={() => setAutoFitScale(true)}
+                      className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-bold transition-colors cursor-pointer min-h-[38px] ${
+                        autoFitScale
+                          ? 'bg-[#0b2b56] text-[#14dac3] border-[#14dac3]/40'
+                          : 'bg-[#0b2b56] text-slate-300 border-white/15 hover:text-white'
+                      }`}
+                      title="محاسبه پویا و خودکار مقیاس بوم با ResizeObserver"
+                    >
+                      تناسب خودکار
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAutoFitScale(false);
+                        setPreviewScale((s) =>
+                          Math.max(0.22, +(s - 0.04).toFixed(2))
+                        );
+                      }}
+                      className="p-2 rounded-lg bg-[#0b2b56] border border-white/15 text-slate-200 hover:text-white cursor-pointer min-h-[38px] min-w-[38px] flex items-center justify-center"
                       title="کوچک‌نمایی"
                     >
                       <ZoomOut className="w-4 h-4" />
@@ -1316,10 +1370,13 @@ export default function App() {
                     </span>
                     <button
                       type="button"
-                      onClick={() =>
-                        setPreviewScale((s) => Math.min(0.65, +(s + 0.04).toFixed(2)))
-                      }
-                      className="p-2 rounded-lg bg-[#0b2b56] border border-white/15 text-slate-200 hover:text-white cursor-pointer min-h-[40px] min-w-[40px] flex items-center justify-center"
+                      onClick={() => {
+                        setAutoFitScale(false);
+                        setPreviewScale((s) =>
+                          Math.min(0.65, +(s + 0.04).toFixed(2))
+                        );
+                      }}
+                      className="p-2 rounded-lg bg-[#0b2b56] border border-white/15 text-slate-200 hover:text-white cursor-pointer min-h-[38px] min-w-[38px] flex items-center justify-center"
                       title="بزرگ‌نمایی"
                     >
                       <ZoomIn className="w-4 h-4" />
@@ -1327,39 +1384,30 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Scaled Multi-Format Viewport (1080×1920, 1080×1350, or 1080×1080) */}
-                <div
-                  className="overflow-hidden rounded-[22px] shadow-2xl border-2 border-[#08cdbd]/40 relative bg-[#062959] mx-auto"
-                  style={{
-                    width: `${Math.round(activeFormat.width * previewScale)}px`,
-                    height: `${Math.round(activeFormat.height * previewScale)}px`,
+                {/* Scaled Multi-Format Viewport with ResizeObserver & Iframe Isolation Support */}
+                <IsolatedStoryCanvasViewport
+                  story={activeStory}
+                  formatSpec={activeFormat}
+                  carouselMeta={activeCarouselMeta}
+                  logoMode={logoMode}
+                  customLogoUrl={customLogoUrl}
+                  logoScale={logoScale}
+                  showSafeZoneGuides={showSafeZoneGuides}
+                  showStickerPlaceholder={showStickerPlaceholder}
+                  previewScale={previewScale}
+                  isolationMode={isolationMode}
+                  onSwitchIsolationMode={(nextMode) => {
+                    setIsolationMode(nextMode);
+                    if (nextMode === 'iframe-isolated') {
+                      setExportStatusMessage(
+                        'حالت رندر ایزوله (Iframe Isolation Mode) برای نمایش بی‌نقص بوم فعال شد.'
+                      );
+                      setTimeout(() => setExportStatusMessage(null), 3500);
+                    }
                   }}
-                >
-                  <div
-                    style={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      transform: `scale(${previewScale})`,
-                      transformOrigin: 'top left',
-                      width: `${activeFormat.width}px`,
-                      height: `${activeFormat.height}px`,
-                    }}
-                  >
-                    <StoryCanvas
-                      story={activeStory}
-                      formatSpec={activeFormat}
-                      carouselMeta={activeCarouselMeta}
-                      logoMode={logoMode}
-                      customLogoUrl={customLogoUrl}
-                      logoScale={logoScale}
-                      showSafeZoneGuides={showSafeZoneGuides}
-                      showStickerPlaceholder={showStickerPlaceholder}
-                      onCanvasMountChange={setCanvasMountEvent}
-                      onAssetEvent={setLastAssetEvent}
-                    />
-                  </div>
-                </div>
+                  onCanvasMountChange={setCanvasMountEvent}
+                  onAssetEvent={setLastAssetEvent}
+                />
               </div>
 
               {/* Hidden / Collapsible Debug Console below Preview Stage */}
@@ -1430,12 +1478,20 @@ export default function App() {
               >
                 <ArkaAIStudioPanel
                   currentUser={currentUser}
+                  accessToken={accessToken}
+                  needsAuth={needsAuth}
                   isSigningIn={isSigningIn}
                   onGoogleSignIn={handleGoogleSignIn}
                   onGoogleSignOut={handleGoogleSignOut}
                   activeStory={activeStory}
                   onInjectSlideIntoCanvas={handleInjectAiSlideIntoCanvas}
                   onInjectCarouselDeckIntoStudio={handleInjectAiCarouselDeck}
+                  onCalendarSavedToDrive={(info) => {
+                    setExportStatusMessage(
+                      `تقویم ۳۰ روزه «${info.title}» با موفقیت به‌عنوان فایل Spreadsheet در Google Drive ذخیره شد!`
+                    );
+                    setTimeout(() => setExportStatusMessage(null), 4500);
+                  }}
                 />
               </div>
 

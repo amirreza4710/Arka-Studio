@@ -322,6 +322,126 @@ ${customPrompt ? `درخواست اختصاصی کاربر: ${customPrompt}` : '
         return res.json({ ok: true, mode, result: parsed });
       }
 
+      if (mode === 'campaign-calendar-30') {
+        const prompt = `یک «تقویم کمپین ۳۰ روزه انتشار استوری و پست اینستاگرام» (AI Campaign Calendar - 30 Days) برای نرم‌افزار حسابداری آرکا (https://arka-acc.ir) با محوریت محصول «${productName}» و چرخه عرضه محصولات سایت آرکا طراحی کن.
+مخاطب هدف: ${targetAudience}
+هدف اصلی کمپین: ${campaignGoal}
+لحن: ${tone}
+${customPrompt ? `نکات اختصاصی کاربر: ${customPrompt}` : ''}
+
+الزامات تقویم ۳۰ روزه:
+- دقیقاً ۳۰ ردیف (روز ۱ تا ۳۰) تولید کن که بر اساس ۴ فاز چرخه عرضه محصولات سایت آرکا (Product Launch Cycles) دسته‌بندی شده باشند:
+  * هفته اول (روز ۱ تا ۷): فاز اول چرخه عرضه — آگاهی از دغدغه‌های مالی اصناف، معرفی هسته یکپارچه آرکا و سرویس مستقیم سامانه مؤدیان (https://arka-acc.ir/pages/tax).
+  * هفته دوم (روز ۸ تا ۱۵): فاز دوم چرخه عرضه — رونمایی و معرفی تخصصی خانواده ۸ محصول آرکا (پکیج جامع مالی، حسابداری فروشگاهی پاچال، حسابداری تولیدی و انبار سوله، بازرگانی ترخیص، رستورانی منو، شرکتی پروژه، آنلاین‌شاپ ویترین، استارتاپی شتاب).
+  * هفته سوم (روز ۱۶ تا ۲۳): فاز سوم چرخه عرضه — اثبات اجتماعی (مطالعه موردی شرکت رنگ بهارستان)، ایجنت هوش مصنوعی مالی آرکا، آموزش‌های آرکا آکادمی و ۱ سال پشتیبانی رایگان.
+  * هفته چهارم (روز ۲۴ تا ۳۰): فاز چهارم چرخه عرضه — کمپین فروش مستقیم، دعوت به تست نسخه دموی رایگان ۱۰۰ سند واقعی (https://arka-acc.ir/demo) و مشاوره تلفنی 051-36079047.
+- برای هر روز، فیلدهای دقیق تیتر و زیرتیتر را بده تا کاربر بتواند هر روز دلخواه را با یک کلیک مستقیماً وارد بوم گرافیکی استودیو کند و کل جدول ۳۰ روزه را به عنوان فایل Spreadsheet در Google Drive ذخیره نماید.`;
+
+        const response = await ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: prompt,
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                calendarTitle: {
+                  type: Type.STRING,
+                  description: 'عنوان تقویم ۳۰ روزه کمپین اینستاگرام آرکا',
+                },
+                launchCycleSummary: {
+                  type: Type.STRING,
+                  description: 'خلاصه استراتژی ۴ فاز چرخه عرضه محصولات سایت آرکا در ۳۰ روز',
+                },
+                scheduleDays: {
+                  type: Type.ARRAY,
+                  description: 'برنامه دقیق ۳۰ روز انتشار (روز ۱ تا ۳۰)',
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      dayNumber: { type: Type.INTEGER, description: 'شماره روز از ۱ تا ۳۰' },
+                      launchPhase: {
+                        type: Type.STRING,
+                        description: 'فاز چرخه محصول (مثلاً هفته ۱: آگاهی و سامانه مؤدیان)',
+                      },
+                      productModule: {
+                        type: Type.STRING,
+                        description: 'محصول یا سرویس مرتبط در سایت arka-acc.ir',
+                      },
+                      formatRecommended: {
+                        type: Type.STRING,
+                        description: 'فرمت پیشنهادی (استوری ۹:۱۶ | پست ۴:۵ | کاروسل ۵ اسلایدی | ریلز)',
+                      },
+                      categoryLabel: {
+                        type: Type.STRING,
+                        description: 'برچسب کوتاه بالای بوم',
+                      },
+                      eyebrow: {
+                        type: Type.STRING,
+                        description: 'روتیتر جذاب بالای تیتر اصلی',
+                      },
+                      headlinePart1: {
+                        type: Type.STRING,
+                        description: 'بخش اول تیتر اصلی بوم',
+                      },
+                      headlineHighlight: {
+                        type: Type.STRING,
+                        description: 'کلمه کلیدی متمایز و رنگی در تیتر',
+                      },
+                      headlinePart2: {
+                        type: Type.STRING,
+                        description: 'بخش پایانی تیتر اصلی',
+                      },
+                      leadCopy: {
+                        type: Type.STRING,
+                        description: 'متن توضیحی زیر تیتر (۲۰ تا ۳۰ کلمه)',
+                      },
+                      primaryStatValue: {
+                        type: Type.STRING,
+                        description: 'شاخص عددی یا کلیدی کارت اصلی (مثلاً ۱۰۰ سند دمو)',
+                      },
+                      primaryStatLabel: {
+                        type: Type.STRING,
+                        description: 'زیرنویس شاخص کلیدی',
+                      },
+                      ctaAction: {
+                        type: Type.STRING,
+                        description: 'دعوت به اقدام (لینک arka-acc.ir/demo یا تماس 051-36079047)',
+                      },
+                      captionSummary: {
+                        type: Type.STRING,
+                        description: 'کپشن یا متن تعاملی استوری آماده انتشار',
+                      },
+                    },
+                    required: [
+                      'dayNumber',
+                      'launchPhase',
+                      'productModule',
+                      'formatRecommended',
+                      'categoryLabel',
+                      'eyebrow',
+                      'headlinePart1',
+                      'headlineHighlight',
+                      'headlinePart2',
+                      'leadCopy',
+                      'primaryStatValue',
+                      'primaryStatLabel',
+                      'ctaAction',
+                      'captionSummary',
+                    ],
+                  },
+                },
+              },
+              required: ['calendarTitle', 'launchCycleSummary', 'scheduleDays'],
+            },
+          },
+        });
+
+        const parsed = JSON.parse((response.text ?? '{}').trim());
+        return res.json({ ok: true, mode: 'campaign-calendar-30', result: parsed });
+      }
+
       // Default / 4th mode: 'campaign-plan' (Sales Campaign & Content Calendar + Caption)
       const prompt = `یک برنامه کمپین فروش و تقویم محتوایی ۵ روزه اینستاگرام (شامل استوری، پست تک‌صفحه، کاروسل و ریلز) همراه با کپشن‌های آماده برای «${productName}» از نرم‌افزار حسابداری آرکا (arka-acc.ir) طراحی کن.
 مخاطب هدف: ${targetAudience}
@@ -381,7 +501,6 @@ ${customPrompt ? `نکات مدنظر کاربر: ${customPrompt}` : ''}
       const parsed = JSON.parse((response.text ?? '{}').trim());
       return res.json({ ok: true, mode: 'campaign-plan', result: parsed });
     } catch (err: any) {
-      console.error('Arka AI generation error:', err);
       const status = err?.status || 500;
       return res.status(status).json({
         ok: false,

@@ -199,7 +199,7 @@ export const GoogleWorkspacePanel: React.FC<GoogleWorkspacePanelProps> = ({
     if (!token || !spreadsheetId || !tabTitle) return;
 
     try {
-      const encodedRange = encodeURIComponent(`${tabTitle}!A1:G25`);
+      const encodedRange = encodeURIComponent(`'${tabTitle}'!A1:L35`);
       const valRes = await fetch(
         `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodedRange}`,
         {
@@ -235,95 +235,106 @@ export const GoogleWorkspacePanel: React.FC<GoogleWorkspacePanelProps> = ({
     fetchSpreadsheetMetadataAndTabs,
   ]);
 
-  // 1. Create a brand-new Google Sheet with all 6 Arka stories/campaigns
-  const handleCreateNewArkaSpreadsheet = async (e: React.FormEvent) => {
+  // 1. Create a brand-new Google Sheet with all 6 Arka stories/campaigns (Requires confirmation)
+  const handleCreateNewArkaSpreadsheet = (e: React.FormEvent) => {
     e.preventDefault();
-    const token = accessToken || (await getAccessToken());
-    if (!token) return;
+    const sheetTitleToCreate =
+      newSpreadsheetTitle.trim() || 'تقویم محتوا و کمپین اینستاگرام آرکا';
 
-    setIsLoading(true);
-    setErrorMsg(null);
-    try {
-      const sheetTabName = 'کمپین_اینستاگرام_آرکا';
-      const headerRow = [
-        'کد طرح',
-        'دسته‌بندی',
-        'روتیتر (Eyebrow)',
-        'تیتر اصلی',
-        'کلمه کلیدی رنگی (Highlight)',
-        'توضیح زیر تیتر (Lead Copy)',
-        'شاخص کلیدی',
-      ];
+    setPendingConfirmation({
+      type: 'append-sheet-row',
+      title: 'تایید ایجاد فایل جدید در Google Sheets',
+      description: `آیا مایل هستید فایل جدول جدید «${sheetTitleToCreate}» همراه با ۶ طرح پایه نرم‌افزار حسابداری آرکا در حساب Google Drive شما ساخته شود؟`,
+      confirmLabel: 'بله، ساخت جدول در Google Drive',
+      onConfirm: async () => {
+        const token = accessToken || (await getAccessToken());
+        if (!token) return;
 
-      const storyRows = allStories.map((st) => [
-        st.id,
-        st.categoryLabel,
-        st.eyebrow,
-        `${st.headlinePart1} ${st.headlinePart2}`.trim(),
-        st.headlineHighlight,
-        st.leadCopy,
-        `${st.primaryStatValue || ''} - ${st.primaryStatLabel || ''}`,
-      ]);
+        setIsLoading(true);
+        setErrorMsg(null);
+        try {
+          const sheetTabName = 'کمپین_اینستاگرام_آرکا';
+          const headerRow = [
+            'کد طرح',
+            'دسته‌بندی',
+            'روتیتر (Eyebrow)',
+            'تیتر اصلی',
+            'کلمه کلیدی رنگی (Highlight)',
+            'توضیح زیر تیتر (Lead Copy)',
+            'شاخص کلیدی',
+          ];
 
-      const createRes = await fetch(
-        'https://sheets.googleapis.com/v4/spreadsheets',
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            properties: {
-              title:
-                newSpreadsheetTitle.trim() ||
-                'تقویم محتوا و کمپین اینستاگرام آرکا',
-            },
-            sheets: [
-              {
-                properties: {
-                  title: sheetTabName,
-                  rightToLeft: true,
-                },
+          const storyRows = allStories.map((st) => [
+            st.id,
+            st.categoryLabel,
+            st.eyebrow,
+            `${st.headlinePart1} ${st.headlinePart2}`.trim(),
+            st.headlineHighlight,
+            st.leadCopy,
+            `${st.primaryStatValue || ''} - ${st.primaryStatLabel || ''}`,
+          ]);
+
+          const createRes = await fetch(
+            'https://sheets.googleapis.com/v4/spreadsheets',
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
               },
-            ],
-          }),
+              body: JSON.stringify({
+                properties: {
+                  title: sheetTitleToCreate,
+                },
+                sheets: [
+                  {
+                    properties: {
+                      title: sheetTabName,
+                      rightToLeft: true,
+                    },
+                  },
+                ],
+              }),
+            }
+          );
+
+          if (!createRes.ok) {
+            throw new Error('خطا در ساخت فایل جدید Google Sheets.');
+          }
+
+          const createdSheet = await createRes.json();
+          const newId = createdSheet.spreadsheetId;
+          const actualTabTitle =
+            createdSheet.sheets?.[0]?.properties?.title || sheetTabName;
+
+          // Populate initial rows
+          const encodedRange = encodeURIComponent(`'${actualTabTitle}'!A1:G7`);
+          await fetch(
+            `https://sheets.googleapis.com/v4/spreadsheets/${newId}/values/${encodedRange}?valueInputOption=USER_ENTERED`,
+            {
+              method: 'PUT',
+              headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                values: [headerRow, ...storyRows],
+              }),
+            }
+          );
+
+          await fetchDriveAndSpreadsheetFiles();
+          setSelectedSpreadsheetId(newId);
+          showNotice(
+            'فایل جدید Google Sheets با موفقیت در Google Drive شما ساخته شد و با ۶ طرح آرکا مقداردهی شد.'
+          );
+        } catch (err: any) {
+          setErrorMsg(err?.message || 'خطا در ایجاد فایل Google Sheets.');
+        } finally {
+          setIsLoading(false);
         }
-      );
-
-      if (!createRes.ok) {
-        throw new Error('خطا در ساخت فایل جدید Google Sheets.');
-      }
-
-      const createdSheet = await createRes.json();
-      const newId = createdSheet.spreadsheetId;
-
-      // Populate initial rows
-      const encodedRange = encodeURIComponent(`${sheetTabName}!A1:G7`);
-      await fetch(
-        `https://sheets.googleapis.com/v4/spreadsheets/${newId}/values/${encodedRange}?valueInputOption=USER_ENTERED`,
-        {
-          method: 'PUT',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            values: [headerRow, ...storyRows],
-          }),
-        }
-      );
-
-      await fetchDriveAndSpreadsheetFiles();
-      setSelectedSpreadsheetId(newId);
-      showNotice(
-        'فایل جدید Google Sheets با موفقیت در Google Drive شما ساخته شد و با ۶ طرح آرکا مقداردهی شد.'
-      );
-    } catch (err: any) {
-      setErrorMsg(err?.message || 'خطا در ایجاد فایل Google Sheets.');
-    } finally {
-      setIsLoading(false);
-    }
+      },
+    });
   };
 
   // 2. Append active StoryCanvas data to the selected Google Sheet (Requires explicit confirmation)
@@ -344,7 +355,7 @@ export const GoogleWorkspacePanel: React.FC<GoogleWorkspacePanelProps> = ({
         setIsLoading(true);
         try {
           const encodedRange = encodeURIComponent(
-            `${selectedSheetTabTitle}!A:G`
+            `'${selectedSheetTabTitle}'!A:G`
           );
           const rowValues = [
             activeStory.id,
@@ -389,8 +400,42 @@ export const GoogleWorkspacePanel: React.FC<GoogleWorkspacePanelProps> = ({
     });
   };
 
-  // 3. Apply a row from Google Sheets directly onto the live StoryCanvas
+  // 3. Apply a row from Google Sheets (supports both 7-col standard & 12-col 30-day calendar) directly onto the live StoryCanvas
   const handleApplySheetRowToCanvas = (row: string[]) => {
+    if (row.length >= 9) {
+      // 12-column 30-day AI Campaign Calendar row
+      const [
+        dayLabel,
+        launchPhase,
+        productModule,
+        ,
+        categoryLabel,
+        eyebrow,
+        fullHeadline,
+        highlight,
+        leadCopy,
+        statCombo,
+      ] = row;
+      onUpdateStory({
+        ...activeStory,
+        categoryLabel:
+          categoryLabel || `${dayLabel} · ${productModule || 'آرکا'}`,
+        headerMeta: `${launchPhase || 'تقویم ۳۰ روزه آرکا'} · arka-acc.ir`,
+        eyebrow: eyebrow || activeStory.eyebrow,
+        headlinePart1: fullHeadline || activeStory.headlinePart1,
+        headlineHighlight: highlight || activeStory.headlineHighlight,
+        headlinePart2: '',
+        leadCopy: leadCopy || activeStory.leadCopy,
+        primaryStatValue: statCombo
+          ? statCombo.split('(')[0]?.trim() || activeStory.primaryStatValue
+          : activeStory.primaryStatValue,
+      });
+      showNotice(
+        `ردیف «${dayLabel}» از تقویم ۳۰ روزه Google Sheets روی بوم اعمال شد!`
+      );
+      return;
+    }
+
     const [, categoryLabel, eyebrow, headlineMain, highlight, leadCopy, stat] =
       row;
     onUpdateStory({
