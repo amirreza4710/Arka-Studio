@@ -143,27 +143,48 @@ export const initAuth = (
   });
 };
 
-export const signInWithGmail = async (): Promise<{
-  user: User;
-  accessToken: string;
-} | null> => {
+export interface GmailSignInResult {
+  ok: boolean;
+  user?: User;
+  accessToken?: string;
+  errorCode?: string;
+  errorMessageFa?: string;
+}
+
+function mapFirebaseAuthErrorToFa(code: string, fallbackMessage?: string): string {
+  switch (code) {
+    case 'auth/popup-closed-by-user':
+      return 'پنجره ورود گوگل قبل از تکمیل بسته شد.';
+    case 'auth/cancelled-popup-request':
+      return 'درخواست هم‌زمان ورود لغو شد. لطفاً یک بار دیگر تلاش کنید.';
+    case 'auth/popup-blocked':
+      return 'پنجره ورود (Popup) توسط مرورگر مسدود شد. لطفاً اجازه باز شدن Popup را در مرورگر فعال کنید.';
+    case 'auth/unauthorized-domain':
+      return 'این دامنه در فهرست دامنه‌های مجاز Firebase Authentication ثبت نشده است.';
+    case 'auth/operation-not-allowed':
+      return 'ورود با Google در تنظیمات Firebase Authentication فعال نیست.';
+    case 'auth/network-request-failed':
+      return 'خطای ارتباط شبکه هنگام اتصال به سرور احراز هویت گوگل.';
+    default:
+      return fallbackMessage || 'ورود با حساب گوگل انجام نشد. لطفاً دوباره تلاش کنید.';
+  }
+}
+
+export const signInWithGmail = async (): Promise<GmailSignInResult> => {
   try {
     isSigningInFlow = true;
     const result = await signInWithPopup(auth, googleProvider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
     const token = credential?.accessToken || '';
     cachedAccessToken = token || null;
-    return { user: result.user, accessToken: token };
+    return { ok: true, user: result.user, accessToken: token };
   } catch (error: any) {
-    const code = error?.code || '';
-    if (
-      code === 'auth/popup-closed-by-user' ||
-      code === 'auth/cancelled-popup-request' ||
-      code === 'auth/popup-blocked'
-    ) {
-      return null;
-    }
-    return null;
+    const code = String(error?.code || 'auth/unknown');
+    return {
+      ok: false,
+      errorCode: code,
+      errorMessageFa: mapFirebaseAuthErrorToFa(code, error?.message),
+    };
   } finally {
     isSigningInFlow = false;
   }

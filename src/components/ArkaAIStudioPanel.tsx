@@ -241,7 +241,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     customApiKey.trim() && customKeyVerifiedInfo?.valid
   );
   const isGmailActive = Boolean(
-    currentUser && !needsAuth && connectionMode === 'gmail-authenticated'
+    currentUser && connectionMode === 'gmail-authenticated'
   );
   const isByokActive = Boolean(
     hasVerifiedByok && connectionMode === 'custom-byok'
@@ -1236,7 +1236,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
         ) : (
           <>
             {/* Quick Google Workspace Sync Strip (when authenticated) */}
-            {currentUser && !needsAuth && (
+            {currentUser && !needsAuth ? (
               <div className="p-2.5 rounded-xl bg-[#e5fbf9] border border-[#08cdbd]/50 flex flex-wrap items-center justify-between gap-2 text-[11px]">
                 <span className="font-bold text-[#062959] flex items-center gap-1.5">
                   <CheckCircle2 className="w-3.5 h-3.5 text-[#089f93] shrink-0" />
@@ -1255,7 +1255,24 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                   )}
                 </div>
               </div>
-            )}
+            ) : currentUser ? (
+              <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/35 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                <span className="font-bold text-amber-200 flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span>
+                    ورود گوگل فعال است (هوش مصنوعی آماده) · برای Drive/Sheets دسترسی را تمدید کنید
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  disabled={isSigningIn}
+                  onClick={onGoogleSignIn}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-400 hover:bg-amber-300 text-[#062959] font-black cursor-pointer shrink-0"
+                >
+                  <span>{isSigningIn ? 'در حال اتصال...' : 'اتصال Drive/Sheets'}</span>
+                </button>
+              </div>
+            ) : null}
 
             {/* AI Prompt Configuration Form */}
             <form onSubmit={handleGenerate} className="space-y-3.5">
@@ -1484,9 +1501,9 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                 </div>
 
                 {/* Optional quick switcher inside HUD when user has verified BYOK or Gmail */}
-                {(hasVerifiedByok || (currentUser && !needsAuth)) && (
+                {(hasVerifiedByok || Boolean(currentUser)) && (
                   <div className="pt-1.5 border-t border-slate-800 flex flex-wrap items-center gap-1">
-                    {currentUser && !needsAuth && (
+                    {currentUser && (
                       <button
                         type="button"
                         onClick={() =>

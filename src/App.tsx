@@ -202,6 +202,7 @@ export default function App() {
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [needsAuth, setNeedsAuth] = useState<boolean>(true);
   const [isSigningIn, setIsSigningIn] = useState<boolean>(false);
+  const [lastAuthError, setLastAuthError] = useState<string | null>(null);
 
   // Logo & Guide state (persisted in localStorage)
   const [logoMode, setLogoMode] = useState<LogoDisplayMode>(() => {
@@ -273,12 +274,13 @@ export default function App() {
       source: DebugLogEntry['source'],
       message: string
     ) => {
-      const now = new Date();
-      const timeStr = now.toTimeString().split(' ')[0];
+      const nowMs = Date.now();
+      const timeStr = new Date(nowMs).toTimeString().split(' ')[0];
       setTelemetryLogs((prev) => [
         {
-          id: `tel-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          id: `tel-${nowMs}-${Math.random().toString(36).slice(2, 7)}`,
           time: timeStr,
+          timestamp: nowMs,
           level,
           source,
           message,
@@ -390,6 +392,7 @@ export default function App() {
         setCurrentUser(user);
         setAccessToken(token);
         setNeedsAuth(false);
+        setLastAuthError(null);
         fetchUserStudioPreferences()
           .then((prefs) => {
             if (prefs) {
@@ -406,6 +409,11 @@ export default function App() {
         setAccessToken(null);
         setNeedsAuth(true);
         if (user) {
+          emitTelemetryLog(
+            'ok',
+            'Auth',
+            `نشست Firebase Auth بازیابی شد (${user.email}) · ID Token برای هوش مصنوعی آماده است (برای Drive/Sheets تمدید پاپ‌آپ لازم است).`
+          );
           fetchUserStudioPreferences()
             .then((prefs) => {
               if (prefs) {
@@ -420,7 +428,7 @@ export default function App() {
       }
     );
     return () => unsub();
-  }, []);
+  }, [emitTelemetryLog]);
 
   // Robust ResizeObserver for dynamic container scale calculation
   useEffect(() => {
@@ -650,7 +658,7 @@ export default function App() {
       // Ignore
     }
     handleChangeConnectionMode(
-      currentUser && !needsAuth ? 'gmail-authenticated' : 'studio-creator-core'
+      currentUser ? 'gmail-authenticated' : 'studio-creator-core'
     );
     emitTelemetryLog('warn', 'Auth', 'کلید API شخصی پاک شد و منبع به حالت پیش‌فرض بازگشت.');
   };
@@ -658,32 +666,58 @@ export default function App() {
   const handleGoogleSignIn = async () => {
     if (isSigningIn) return;
     setIsSigningIn(true);
+    setLastAuthError(null);
     try {
       const result = await signInWithGmail();
-      if (!result) {
-        setExportStatusMessage(
-          'پنجره ورود با گوگل بسته شد. در صورت مسدود بودن پاپ‌آپ مرورگر، لطفاً اجازه باز شدن پنجره را بدهید و دوباره تلاش کنید.'
+      if (!result.ok || !result.user) {
+        const errMsg =
+          result.errorMessageFa ||
+          'پنجره ورود با گوگل بسته شد یا توسط مرورگر مسدود شده است.';
+        setLastAuthError(errMsg);
+        emitTelemetryLog(
+          'warn',
+          'Auth',
+          `ورود ناموفق (${result.errorCode || 'unknown'}): ${errMsg}`
         );
-        setTimeout(() => setExportStatusMessage(null), 4000);
+        setExportStatusMessage(errMsg);
+        setTimeout(() => setExportStatusMessage(null), 5000);
         return;
       }
+
       setCurrentUser(result.user);
       setAccessToken(result.accessToken || null);
       setNeedsAuth(!result.accessToken);
+      setLastAuthError(null);
+
+      if (preferredConnectionMode === 'studio-creator-core') {
+        setPreferredConnectionMode('gmail-authenticated');
+        saveUserStudioPreferences({
+          darkMode,
+          preferredConnectionMode: 'gmail-authenticated',
+        }).catch(() => {
+          // Ignore
+        });
+      }
+
       emitTelemetryLog(
         'ok',
         'Auth',
-        `ورود موفق با حساب گوگل (${result.user.email}) · دسترسی Drive و Sheets فعال شد.`
+        `ورود موفق با حساب گوگل (${result.user.email}) · ${
+          result.accessToken
+            ? 'Firebase ID Token و دسترسی Drive/Sheets فعال شد.'
+            : 'Firebase ID Token فعال شد (توکن Workspace دریافت نشد).'
+        }`
       );
       setExportStatusMessage(
-        `خوش آمدید ${result.user.displayName || result.user.email}! دسترسی Google Sheets، Google Drive و هوش مصنوعی آرکا فعال شد.`
+        `خوش آمدید ${result.user.displayName || result.user.email}! حساب گوگل شما متصل شد.`
       );
       setTimeout(() => setExportStatusMessage(null), 4000);
-    } catch {
-      setExportStatusMessage(
-        'ورود با حساب گوگل انجام نشد. لطفاً دوباره تلاش کنید.'
-      );
-      setTimeout(() => setExportStatusMessage(null), 3500);
+    } catch (err: any) {
+      const fallback = err?.message || 'ورود با حساب گوگل انجام نشد. لطفاً دوباره تلاش کنید.';
+      setLastAuthError(fallback);
+      emitTelemetryLog('error', 'Auth', fallback);
+      setExportStatusMessage(fallback);
+      setTimeout(() => setExportStatusMessage(null), 4000);
     } finally {
       setIsSigningIn(false);
     }
@@ -694,6 +728,7 @@ export default function App() {
     setCurrentUser(null);
     setAccessToken(null);
     setNeedsAuth(true);
+    setLastAuthError(null);
     emitTelemetryLog('warn', 'Auth', 'خروج از حساب گوگل انجام شد.');
     setExportStatusMessage('از حساب گوگل خارج شدید.');
     setTimeout(() => setExportStatusMessage(null), 2500);
@@ -1548,7 +1583,6 @@ export default function App() {
                 preferredConnectionMode === 'custom-byok'
                   ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/50'
                   : currentUser &&
-                    !needsAuth &&
                     preferredConnectionMode === 'gmail-authenticated'
                   ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/50'
                   : 'bg-purple-500/15 text-purple-300 border-purple-500/50'
@@ -1562,7 +1596,6 @@ export default function App() {
                 preferredConnectionMode === 'custom-byok'
                   ? '🔵 کلید شخصی (BYOK)'
                   : currentUser &&
-                    !needsAuth &&
                     preferredConnectionMode === 'gmail-authenticated'
                   ? '🟢 اکانت جیمیل'
                   : '🟠 مدیریت اعتبار و API Key'}
@@ -1570,15 +1603,40 @@ export default function App() {
             </button>
 
             {/* Official Sign in with Google Button or Active Account */}
-            {currentUser && !needsAuth ? (
+            {currentUser ? (
               <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white border border-[#08cdbd] text-xs font-bold text-[#062959]">
-                <span className="truncate max-w-[160px]" dir="ltr">
+                {currentUser.photoURL ? (
+                  <img
+                    src={currentUser.photoURL}
+                    alt={currentUser.displayName || 'کاربر گوگل'}
+                    referrerPolicy="no-referrer"
+                    className="w-5 h-5 rounded-full border border-[#08cdbd] shrink-0"
+                  />
+                ) : (
+                  <span
+                    className={`w-2 h-2 rounded-full shrink-0 ${
+                      accessToken && !needsAuth ? 'bg-emerald-500' : 'bg-amber-400'
+                    }`}
+                  />
+                )}
+                <span className="truncate max-w-[150px]" dir="ltr">
                   {currentUser.email}
                 </span>
+                {(!accessToken || needsAuth) && (
+                  <button
+                    type="button"
+                    disabled={isSigningIn}
+                    onClick={handleGoogleSignIn}
+                    className="px-2 py-0.5 rounded-md bg-amber-400 hover:bg-amber-300 text-[#062959] text-[10px] font-black cursor-pointer whitespace-nowrap"
+                    title="برای دسترسی به Google Drive و Sheets پنجره تایید گوگل را باز کنید"
+                  >
+                    {isSigningIn ? '...' : 'تمدید Drive'}
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={handleGoogleSignOut}
-                  className="text-rose-600 hover:text-rose-700 cursor-pointer"
+                  className="text-rose-500 hover:text-rose-400 cursor-pointer"
                   title="خروج از حساب گوگل"
                 >
                   <LogOut className="w-3.5 h-3.5" />
@@ -2038,9 +2096,34 @@ export default function App() {
                 logoMode={logoMode}
                 customLogoUrl={customLogoUrl}
                 previewScale={previewScale}
+                isolationMode={isolationMode}
                 canvasMountEvent={canvasMountEvent}
                 lastAssetEvent={lastAssetEvent}
                 externalLogs={telemetryLogs}
+                authDebugInfo={{
+                  isSignedIn: Boolean(currentUser),
+                  email: currentUser?.email || null,
+                  hasWorkspaceToken: Boolean(accessToken && !needsAuth),
+                  hasByokKey: Boolean(customApiKey && customKeyVerifiedInfo?.valid),
+                  creditSourceLabel:
+                    customApiKey &&
+                    customKeyVerifiedInfo?.valid &&
+                    preferredConnectionMode === 'custom-byok'
+                      ? 'کلید شخصی (BYOK)'
+                      : currentUser &&
+                        preferredConnectionMode === 'gmail-authenticated'
+                      ? `اکانت جیمیل (${currentUser.email || 'متصل'})`
+                      : currentUser
+                      ? 'حساب گوگل + سرور آرکا'
+                      : 'مهمان (بدون لاگین)',
+                  lastAuthError,
+                }}
+                onOpenAuthKeyModal={() => {
+                  setByokDraftInput(customApiKey);
+                  setByokDraftVerifiedInfo(customKeyVerifiedInfo);
+                  setByokVerifyError(null);
+                  setIsAuthKeyModalOpen(true);
+                }}
                 onClearExternalLogs={() => setTelemetryLogs([])}
                 onHardReset={handleResetAllStories}
               />
@@ -2443,12 +2526,93 @@ export default function App() {
               </button>
             </div>
 
+            {/* Google Auth & Workspace Session Summary */}
+            <div className="p-3 rounded-xl bg-[#07090E] border border-slate-800 space-y-2 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span
+                    className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                      currentUser ? 'bg-emerald-400' : 'bg-amber-400'
+                    }`}
+                  />
+                  <span className="font-black text-white truncate">
+                    {currentUser
+                      ? `واردشده با گوگل: ${currentUser.email}`
+                      : 'وضعیت فعلی: کاربر مهمان (وارد نشده)'}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {currentUser ? (
+                    <>
+                      {(!accessToken || needsAuth) && (
+                        <button
+                          type="button"
+                          disabled={isSigningIn}
+                          onClick={handleGoogleSignIn}
+                          className="px-2.5 py-1 rounded-lg bg-amber-400 hover:bg-amber-300 text-[#062959] text-[11px] font-black cursor-pointer"
+                        >
+                          {isSigningIn ? 'در حال اتصال...' : 'تمدید Drive/Sheets'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={handleGoogleSignOut}
+                        className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 text-[11px] font-bold cursor-pointer"
+                      >
+                        خروج
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={isSigningIn}
+                      onClick={handleGoogleSignIn}
+                      className="px-3 py-1 rounded-lg bg-[#08cdbd] hover:bg-[#14dac3] text-[#062959] text-[11px] font-black cursor-pointer"
+                    >
+                      {isSigningIn ? 'در حال اتصال...' : 'ورود با حساب گوگل'}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+                <span>
+                  هوش مصنوعی (ID Token):{' '}
+                  <strong className={currentUser ? 'text-emerald-300' : 'text-amber-300'}>
+                    {currentUser ? 'آماده ✓' : 'نیاز به ورود یا کلید شخصی'}
+                  </strong>
+                </span>
+                <span aria-hidden="true">·</span>
+                <span>
+                  Drive/Sheets (OAuth):{' '}
+                  <strong
+                    className={
+                      accessToken && !needsAuth ? 'text-emerald-300' : 'text-amber-300'
+                    }
+                  >
+                    {accessToken && !needsAuth
+                      ? 'متصل ✓'
+                      : currentUser
+                      ? 'نیاز به تمدید پاپ‌آپ'
+                      : 'غیرفعال'}
+                  </strong>
+                </span>
+              </div>
+
+              {lastAuthError && (
+                <div className="p-2 rounded-lg bg-rose-500/10 border border-rose-500/40 text-rose-300 text-[11px] flex items-start gap-2">
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                  <span>{lastAuthError}</span>
+                </div>
+              )}
+            </div>
+
             {/* Active Source Selector Cards */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
               <button
                 type="button"
                 onClick={() => {
-                  if (!currentUser || needsAuth) {
+                  if (!currentUser) {
                     handleGoogleSignIn();
                   } else {
                     handleChangeConnectionMode('gmail-authenticated');
@@ -2456,7 +2620,6 @@ export default function App() {
                 }}
                 className={`p-3 rounded-xl border text-right cursor-pointer transition-all ${
                   currentUser &&
-                  !needsAuth &&
                   preferredConnectionMode === 'gmail-authenticated'
                     ? 'bg-emerald-500/15 border-emerald-400 text-white'
                     : 'bg-[#07090E] border-slate-800 text-slate-300 hover:border-emerald-500/40'
@@ -2466,9 +2629,13 @@ export default function App() {
                   🟢 حالت ۱: اکانت جیمیل
                 </div>
                 <div className="text-[10px] text-slate-400 mt-1">
-                  {currentUser && !needsAuth
-                    ? `${currentUser.email} (Drive + Sheets فعال)`
-                    : 'اتصال به Google Drive و Sheets'}
+                  {currentUser
+                    ? `${currentUser.email} (${
+                        accessToken && !needsAuth
+                          ? 'AI + Drive/Sheets فعال'
+                          : 'AI فعال · Drive نیاز به تمدید'
+                      })`
+                    : 'ورود گوگل + اتصال Drive و Sheets'}
                 </div>
               </button>
 
