@@ -8,10 +8,16 @@ import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import {
   ARKA_SYSTEM_INSTRUCTION,
+  ArkaBrandProfile,
+  ArkaOrgRole,
+  ArkaOrganizationMember,
+  CANONICAL_ARKA_ORG_ID,
   ClassifiedAiError,
+  DEFAULT_ARKA_BRAND_PROFILE,
   GEMINI_MODEL_CAPABILITY_REGISTRY,
   GeminiRouterModelId,
   resolveSmartModelForTask,
+  validateArkaInternalUrl,
   validateModelCapabilityForTask,
 } from './src/config/arkaCore';
 
@@ -131,8 +137,11 @@ export async function verifyFirebaseIdToken(
 // SERVER-SIDE AES-256-GCM ENCRYPTED BYOK VAULT (MULTI-USER ISOLATED BY UID)
 // ============================================================================
 
-interface EncryptedVaultRecord {
+export const CURRENT_ENCRYPTION_VERSION = 2;
+
+export interface EncryptedVaultRecord {
   uid: string;
+  encryptionVersion?: number;
   ivHex: string;
   authTagHex: string;
   ciphertextHex: string;
@@ -148,25 +157,31 @@ const VAULT_DIR = path.join(__dirname, '.data');
 const VAULT_FILE_PATH = path.join(VAULT_DIR, 'byok-vault.enc.json');
 const byokVaultStore = new Map<string, EncryptedVaultRecord>();
 
-function deriveUserVaultKey(uid: string): Buffer {
+function deriveUserVaultKey(uid: string, version = CURRENT_ENCRYPTION_VERSION): Buffer {
+  // Priority: ENCRYPTION_KEY (server-side secret) -> BYOK_VAULT_SECRET -> fallback
   const masterSecret =
+    process.env.ENCRYPTION_KEY ||
     process.env.BYOK_VAULT_SECRET ||
     process.env.GEMINI_API_KEY ||
     firebaseWebApiKey ||
     'arka-enterprise-studio-vault-secret-v1';
-  return crypto.pbkdf2Sync(
-    masterSecret,
-    `arka-uid-salt:${uid}`,
-    10000,
-    32,
-    'sha256'
-  );
+  const salt =
+    version >= 2 ? `arka-uid-salt:v2:${uid}` : `arka-uid-salt:${uid}`;
+  return crypto.pbkdf2Sync(masterSecret, salt, 10000, 32, 'sha256');
 }
 
 export function maskApiKey(rawKey: string): string {
   const clean = String(rawKey || '').trim();
   if (clean.length <= 8) return '••••••••';
   return `${clean.slice(0, 4)}••••••••${clean.slice(-4)}`;
+}
+
+export function redactSensitiveText(input: string): string {
+  const text = String(input || '');
+  return text
+    .replace(/AIza[0-9A-Za-z\-_]{15,}/g, '[REDACTED_GEMINI_KEY]')
+    .replace(/Bearer\s+[0-9A-Za-z\-_.]+/gi, 'Bearer [REDACTED_TOKEN]')
+    .replace(/ya29\.[0-9A-Za-z\-_]+/g, '[REDACTED_OAUTH_TOKEN]');
 }
 
 function loadEncryptedVaultFromDisk(): void {
@@ -226,11 +241,13 @@ export function storeEncryptedUserApiKey(params: {
     throw new Error('شناسه کاربر و کلید API برای رمزنگاری الزامی است.');
   }
 
-  const keyBuf = deriveUserVaultKey(uid);
+  const version = CURRENT_ENCRYPTION_VERSION;
+  const keyBuf = deriveUserVaultKey(uid, version);
+  // Unique 96-bit cryptographic nonce per encryption operation
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', keyBuf, iv);
-  // Bind UID as Additional Authenticated Data (AAD) so ciphertext cannot be transplanted across users
-  cipher.setAAD(Buffer.from(`arka-uid:${uid}`, 'utf8'));
+  // Bind UID and encryption version as Additional Authenticated Data (AAD)
+  cipher.setAAD(Buffer.from(`arka-uid:${uid}:v${version}`, 'utf8'));
 
   const encrypted = Buffer.concat([
     cipher.update(cleanKey, 'utf8'),
@@ -246,6 +263,7 @@ export function storeEncryptedUserApiKey(params: {
 
   const record: EncryptedVaultRecord = {
     uid,
+    encryptionVersion: version,
     ivHex: iv.toString('hex'),
     authTagHex: authTag.toString('hex'),
     ciphertextHex: encrypted.toString('hex'),
@@ -262,6 +280,7 @@ export function storeEncryptedUserApiKey(params: {
 
   return {
     uid: record.uid,
+    encryptionVersion: record.encryptionVersion,
     maskedKey: record.maskedKey,
     provider: record.provider,
     models: record.models,
@@ -271,20 +290,57 @@ export function storeEncryptedUserApiKey(params: {
   };
 }
 
+// Helper for testing backward-compatible decryption of legacy v1 vault records
+export function storeLegacyV1EncryptedUserApiKeyForTests(params: {
+  uid: string;
+  rawApiKey: string;
+}): void {
+  const uid = String(params.uid || '').trim();
+  const cleanKey = String(params.rawApiKey || '').trim();
+  const keyBuf = deriveUserVaultKey(uid, 1);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', keyBuf, iv);
+  cipher.setAAD(Buffer.from(`arka-uid:${uid}`, 'utf8'));
+  const encrypted = Buffer.concat([
+    cipher.update(cleanKey, 'utf8'),
+    cipher.final(),
+  ]);
+  const authTag = cipher.getAuthTag();
+  byokVaultStore.set(uid, {
+    uid,
+    encryptionVersion: 1,
+    ivHex: iv.toString('hex'),
+    authTagHex: authTag.toString('hex'),
+    ciphertextHex: encrypted.toString('hex'),
+    maskedKey: maskApiKey(cleanKey),
+    provider: 'gemini',
+    models: ['gemini-2.5-flash'],
+    hasPro: false,
+    hasFlash: true,
+    updatedAt: 'Legacy-v1',
+  });
+}
+
 export function decryptUserApiKeyForUid(uid: string): string | null {
   const cleanUid = String(uid || '').trim();
   if (!cleanUid) return null;
   const record = byokVaultStore.get(cleanUid);
   if (!record || record.uid !== cleanUid) return null;
 
+  const recVersion = record.encryptionVersion || 1;
+
   try {
-    const keyBuf = deriveUserVaultKey(cleanUid);
+    const keyBuf = deriveUserVaultKey(cleanUid, recVersion);
     const iv = Buffer.from(record.ivHex, 'hex');
     const authTag = Buffer.from(record.authTagHex, 'hex');
     const ciphertext = Buffer.from(record.ciphertextHex, 'hex');
 
     const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuf, iv);
-    decipher.setAAD(Buffer.from(`arka-uid:${cleanUid}`, 'utf8'));
+    const aadString =
+      recVersion >= 2
+        ? `arka-uid:${cleanUid}:v${recVersion}`
+        : `arka-uid:${cleanUid}`;
+    decipher.setAAD(Buffer.from(aadString, 'utf8'));
     decipher.setAuthTag(authTag);
 
     const decrypted = Buffer.concat([
@@ -307,6 +363,7 @@ export function getUserVaultMetadata(uid: string): Omit<
   if (!rec || rec.uid !== cleanUid) return null;
   return {
     uid: rec.uid,
+    encryptionVersion: rec.encryptionVersion || 1,
     maskedKey: rec.maskedKey,
     provider: rec.provider,
     models: rec.models,
@@ -324,6 +381,245 @@ export function deleteUserApiKeyFromVault(uid: string): boolean {
     persistEncryptedVaultToDisk();
   }
   return existed;
+}
+
+// ============================================================================
+// CANONICAL ORGANIZATION (arka_org) RBAC & VERSIONED BRAND PROFILE STORE
+// ============================================================================
+
+const ORG_BRAND_FILE_PATH = path.join(VAULT_DIR, 'arka-org-brand.json');
+const orgMembersStore = new Map<string, ArkaOrgRole>();
+
+let canonicalOrgBrandProfile: ArkaBrandProfile = {
+  ...DEFAULT_ARKA_BRAND_PROFILE,
+  orgId: CANONICAL_ARKA_ORG_ID,
+  version: 1,
+  updatedAt: 'نسخه پایه سازمانی آرکا',
+  updatedByEmail: ADMIN_OWNER_EMAIL,
+};
+
+function loadCanonicalOrgBrandFromDisk(): void {
+  try {
+    if (!fs.existsSync(ORG_BRAND_FILE_PATH)) return;
+    const raw = fs.readFileSync(ORG_BRAND_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && parsed.brandName) {
+      canonicalOrgBrandProfile = {
+        ...DEFAULT_ARKA_BRAND_PROFILE,
+        ...parsed,
+        orgId: CANONICAL_ARKA_ORG_ID,
+        version: Math.max(1, Number(parsed.version || 1)),
+      };
+    }
+  } catch {
+    // Ignore disk read error
+  }
+}
+
+function persistCanonicalOrgBrandToDisk(): void {
+  try {
+    if (!fs.existsSync(VAULT_DIR)) {
+      fs.mkdirSync(VAULT_DIR, { recursive: true, mode: 0o700 });
+    }
+    fs.writeFileSync(
+      ORG_BRAND_FILE_PATH,
+      JSON.stringify(canonicalOrgBrandProfile, null, 2),
+      { encoding: 'utf8', mode: 0o600 }
+    );
+  } catch {
+    // Ignore disk write error in read-only environments
+  }
+}
+
+loadCanonicalOrgBrandFromDisk();
+
+export function assignOrgMemberRoleForTests(
+  uid: string,
+  role: ArkaOrgRole | null
+): void {
+  if (!role) {
+    orgMembersStore.delete(uid);
+  } else {
+    orgMembersStore.set(uid, role);
+  }
+}
+
+export function resolveOrgMembershipForUser(
+  user: VerifiedFirebaseUser | null | undefined
+): ArkaOrganizationMember | null {
+  if (!user || !user.uid || user.emailVerified === false) {
+    return null;
+  }
+  if (isVerifiedAdminUser(user)) {
+    return {
+      uid: user.uid,
+      email: user.email || ADMIN_OWNER_EMAIL,
+      role: 'owner',
+      orgId: CANONICAL_ARKA_ORG_ID,
+      canEditBrandProfile: true,
+    };
+  }
+  const assignedRole = orgMembersStore.get(user.uid) || 'viewer';
+  return {
+    uid: user.uid,
+    email: user.email || 'user@arka-acc.ir',
+    role: assignedRole,
+    orgId: CANONICAL_ARKA_ORG_ID,
+    canEditBrandProfile: ['owner', 'admin', 'editor'].includes(assignedRole),
+  };
+}
+
+export function getCanonicalOrgBrandProfile(): ArkaBrandProfile {
+  return { ...canonicalOrgBrandProfile, orgId: CANONICAL_ARKA_ORG_ID };
+}
+
+export function updateCanonicalOrgBrandProfile(params: {
+  user: VerifiedFirebaseUser | null | undefined;
+  requestedOrgId?: string;
+  profilePatch: Partial<ArkaBrandProfile>;
+}):
+  | { ok: true; profile: ArkaBrandProfile; membership: ArkaOrganizationMember }
+  | { ok: false; classifiedError: ClassifiedAiError } {
+  const reqOrg = String(
+    params.requestedOrgId || CANONICAL_ARKA_ORG_ID
+  ).trim();
+  if (reqOrg !== CANONICAL_ARKA_ORG_ID) {
+    return {
+      ok: false,
+      classifiedError: {
+        errorCode: 'PERMISSION_DENIED',
+        httpStatus: 403,
+        messageFa: `سازمان درخواستی («${reqOrg}») مجاز نیست. استودیو آرکا منحصراً روی سازمان رسمی «${CANONICAL_ARKA_ORG_ID}» فعال است.`,
+        technicalReason: 'UNAUTHORIZED_ORGANIZATION_ID',
+        retryable: false,
+        canFallbackToFlash: false,
+        suggestedFallbackModel: null,
+      },
+    };
+  }
+
+  if (!params.user) {
+    return {
+      ok: false,
+      classifiedError: {
+        errorCode: 'AUTH_REQUIRED',
+        httpStatus: 401,
+        messageFa:
+          'برای ویرایش پروفایل رسمی برند سازمان آرکا (arka_org)، ابتدا باید وارد حساب کاربری تاییدشده خود شوید.',
+        technicalReason: 'UNAUTHENTICATED_BRAND_UPDATE',
+        retryable: false,
+        canFallbackToFlash: false,
+        suggestedFallbackModel: null,
+      },
+    };
+  }
+
+  const membership = resolveOrgMembershipForUser(params.user);
+  if (!membership || !membership.canEditBrandProfile) {
+    return {
+      ok: false,
+      classifiedError: {
+        errorCode: 'PERMISSION_DENIED',
+        httpStatus: 403,
+        messageFa:
+          'شما مجوز ویرایش پروفایل رسمی هوش برند سازمان آرکا (arka_org) را ندارید (نقش شما: مشاهده‌گر / Viewer). تنظیمات شخصی شما هرگز هویت رسمی سازمان را بازنویسی نمی‌کند.',
+        technicalReason: 'INSUFFICIENT_ORG_ROLE',
+        retryable: false,
+        canFallbackToFlash: false,
+        suggestedFallbackModel: null,
+      },
+    };
+  }
+
+  const nextVersion = Math.max(1, Number(canonicalOrgBrandProfile.version || 1) + 1);
+  const nowLabel = new Intl.DateTimeFormat('fa-IR', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date());
+
+  const cleanPatch = params.profilePatch || {};
+  canonicalOrgBrandProfile = {
+    ...canonicalOrgBrandProfile,
+    brandName: String(cleanPatch.brandName || canonicalOrgBrandProfile.brandName).slice(0, 200),
+    tagline: String(cleanPatch.tagline || canonicalOrgBrandProfile.tagline).slice(0, 300),
+    websiteUrl: String(cleanPatch.websiteUrl || canonicalOrgBrandProfile.websiteUrl).slice(0, 200),
+    demoUrl: String(cleanPatch.demoUrl || canonicalOrgBrandProfile.demoUrl).slice(0, 200),
+    taxLandingUrl: String(cleanPatch.taxLandingUrl || canonicalOrgBrandProfile.taxLandingUrl).slice(0, 200),
+    phone: String(cleanPatch.phone || canonicalOrgBrandProfile.phone).slice(0, 60),
+    headquarters: String(cleanPatch.headquarters || canonicalOrgBrandProfile.headquarters).slice(0, 300),
+    coreValueProposition: String(cleanPatch.coreValueProposition || canonicalOrgBrandProfile.coreValueProposition).slice(0, 1500),
+    targetAudienceSegments: String(cleanPatch.targetAudienceSegments || canonicalOrgBrandProfile.targetAudienceSegments).slice(0, 1500),
+    toneOfVoice: String(cleanPatch.toneOfVoice || canonicalOrgBrandProfile.toneOfVoice).slice(0, 800),
+    visualIdentityNotes: String(cleanPatch.visualIdentityNotes || canonicalOrgBrandProfile.visualIdentityNotes).slice(0, 800),
+    competitivePositioning: String(cleanPatch.competitivePositioning || canonicalOrgBrandProfile.competitivePositioning).slice(0, 1500),
+    marketingObjectives: String(cleanPatch.marketingObjectives || canonicalOrgBrandProfile.marketingObjectives).slice(0, 1500),
+    focusKeywords: String(cleanPatch.focusKeywords || canonicalOrgBrandProfile.focusKeywords).slice(0, 1000),
+    internalLinkPillars: String(cleanPatch.internalLinkPillars || canonicalOrgBrandProfile.internalLinkPillars).slice(0, 1000),
+    approvedClaims: String(cleanPatch.approvedClaims || canonicalOrgBrandProfile.approvedClaims || '').slice(0, 1500),
+    systemsCatalogSummary: String(cleanPatch.systemsCatalogSummary || canonicalOrgBrandProfile.systemsCatalogSummary || '').slice(0, 1500),
+    orgId: CANONICAL_ARKA_ORG_ID,
+    version: nextVersion,
+    updatedAt: nowLabel,
+    updatedByEmail: membership.email,
+  };
+
+  persistCanonicalOrgBrandToDisk();
+  return {
+    ok: true,
+    profile: { ...canonicalOrgBrandProfile },
+    membership,
+  };
+}
+
+// ============================================================================
+// SAFE METADATA AUDIT LOGGER (ZERO SECRETS / ZERO CREDENTIALS LOGGED)
+// ============================================================================
+
+export interface SafeAiAuditLogEntry {
+  id: string;
+  timestamp: string;
+  uid: string;
+  organizationId: typeof CANONICAL_ARKA_ORG_ID;
+  credentialSource: string;
+  model: string;
+  operation: string;
+  outcome: 'success' | 'error';
+  errorCategory?: string;
+  latencyMs: number;
+}
+
+const safeAiAuditLogs: SafeAiAuditLogEntry[] = [];
+
+export function recordSafeAiAuditLog(
+  entry: Omit<SafeAiAuditLogEntry, 'id' | 'timestamp' | 'organizationId'>
+): SafeAiAuditLogEntry {
+  const safeItem: SafeAiAuditLogEntry = {
+    id: `audit_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: new Date().toISOString(),
+    uid: redactSensitiveText(entry.uid || 'anonymous'),
+    organizationId: CANONICAL_ARKA_ORG_ID,
+    credentialSource: redactSensitiveText(entry.credentialSource),
+    model: redactSensitiveText(entry.model),
+    operation: redactSensitiveText(entry.operation),
+    outcome: entry.outcome,
+    errorCategory: entry.errorCategory
+      ? redactSensitiveText(entry.errorCategory)
+      : undefined,
+    latencyMs: Math.max(0, Number(entry.latencyMs || 0)),
+  };
+  safeAiAuditLogs.unshift(safeItem);
+  if (safeAiAuditLogs.length > 100) {
+    safeAiAuditLogs.length = 100;
+  }
+  return safeItem;
+}
+
+export function getSafeAiAuditLogs(uidFilter?: string | null): SafeAiAuditLogEntry[] {
+  if (!uidFilter) return safeAiAuditLogs.slice(0, 20);
+  return safeAiAuditLogs.filter((l) => l.uid === uidFilter).slice(0, 20);
 }
 
 // ============================================================================
@@ -1064,6 +1360,16 @@ const SEO_ARTICLE_SCHEMA = {
       type: Type.STRING,
       description: 'کپشن اینستاگرام استخراج‌شده از مقاله به همراه هشتگ‌ها',
     },
+    verifiedArkaFacts: {
+      type: Type.ARRAY,
+      description: 'فکت‌ها و آمارهای مستند و تاییدشده از کاتالوگ رسمی آرکا که در مقاله استفاده شده‌اند',
+      items: { type: Type.STRING },
+    },
+    claimsRequiringVerification: {
+      type: Type.ARRAY,
+      description: 'ادعاها یا نکات عمومی بازار/مالیات که پیش از انتشار نهایی نیاز به بازبینی انسانی دارند',
+      items: { type: Type.STRING },
+    },
     heroSlide: SLIDE_SCHEMA,
   },
   required: [
@@ -1083,6 +1389,8 @@ const SEO_ARTICLE_SCHEMA = {
     'internalLinks',
     'linkedinPostSnippet',
     'instagramCaptionSnippet',
+    'verifiedArkaFacts',
+    'claimsRequiringVerification',
     'heroSlide',
   ],
 };
@@ -1090,6 +1398,69 @@ const SEO_ARTICLE_SCHEMA = {
 export function createArkaExpressApp() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
+
+  // 0. Canonical Organization (arka_org) Brand Intelligence Hub Endpoints
+  app.get('/api/arka-org/brand-profile', async (req, res) => {
+    try {
+      const bearerToken = extractBearerToken(req);
+      const verifiedUser = bearerToken
+        ? await verifyFirebaseIdToken(bearerToken)
+        : null;
+      const membership = resolveOrgMembershipForUser(verifiedUser);
+      return res.json({
+        ok: true,
+        organizationId: CANONICAL_ARKA_ORG_ID,
+        profile: getCanonicalOrgBrandProfile(),
+        membership: membership || {
+          uid: 'guest',
+          email: '',
+          role: 'viewer',
+          orgId: CANONICAL_ARKA_ORG_ID,
+          canEditBrandProfile: false,
+        },
+      });
+    } catch {
+      return res.status(500).json({
+        ok: false,
+        error: 'خطا در دریافت پروفایل رسمی هوش برند سازمان آرکا.',
+      });
+    }
+  });
+
+  app.put('/api/arka-org/brand-profile', async (req, res) => {
+    try {
+      const bearerToken = extractBearerToken(req);
+      const verifiedUser = bearerToken
+        ? await verifyFirebaseIdToken(bearerToken)
+        : null;
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const result = updateCanonicalOrgBrandProfile({
+        user: verifiedUser,
+        requestedOrgId: body.organizationId,
+        profilePatch: body.profile || body,
+      });
+
+      if (!result.ok) {
+        return res.status(result.classifiedError.httpStatus).json({
+          ok: false,
+          error: result.classifiedError.messageFa,
+          errorDetails: result.classifiedError,
+        });
+      }
+
+      return res.json({
+        ok: true,
+        organizationId: CANONICAL_ARKA_ORG_ID,
+        profile: result.profile,
+        membership: result.membership,
+      });
+    } catch {
+      return res.status(500).json({
+        ok: false,
+        error: 'خطا در بروزرسانی پروفایل رسمی هوش برند سازمان آرکا.',
+      });
+    }
+  });
 
   // 1. Live Arka Website Sync Endpoint with 6-Hour In-Memory Cache & Force Refresh
   app.get('/api/arka-site/live-context', async (req, res) => {
@@ -1486,10 +1857,16 @@ export function createArkaExpressApp() {
 
       res.json({
         ok: true,
+        organizationId: CANONICAL_ARKA_ORG_ID,
         serverKeyConfigured: hasServerKey,
         userVaultConfigured: Boolean(vaultMeta),
         userMaskedKey: vaultMeta?.maskedKey || null,
+        encryptionVersion: vaultMeta?.encryptionVersion || CURRENT_ENCRYPTION_VERSION,
         isAdminFallbackAllowed: isVerifiedAdminUser(verifiedUser) && hasServerKey,
+        canonicalBrandVersion: getCanonicalOrgBrandProfile().version || 1,
+        recentAuditLogs: verifiedUser
+          ? getSafeAiAuditLogs(isVerifiedAdminUser(verifiedUser) ? null : verifiedUser.uid)
+          : [],
         capabilityRegistry: GEMINI_MODEL_CAPABILITY_REGISTRY,
         availableModels: [
           {
@@ -1759,12 +2136,40 @@ export function createArkaExpressApp() {
         });
       }
 
+      // Enforce canonical organization (arka_org) — never trust a foreign client-supplied organizationId
+      if (
+        body.organizationId &&
+        String(body.organizationId).trim() !== CANONICAL_ARKA_ORG_ID
+      ) {
+        return res.status(403).json({
+          ok: false,
+          error: `سازمان ارسالی («${String(body.organizationId)}») مجاز نیست. استودیو آرکا روی سازمان «${CANONICAL_ARKA_ORG_ID}» قفل شده است.`,
+          errorDetails: {
+            errorCode: 'PERMISSION_DENIED',
+            httpStatus: 403,
+            messageFa: `سازمان ارسالی مجاز نیست. فقط «${CANONICAL_ARKA_ORG_ID}» مجاز است.`,
+            retryable: false,
+            canFallbackToFlash: false,
+            suggestedFallbackModel: null,
+          },
+        });
+      }
+
       const resolved = resolveAuthorizedGeminiClient({
         verifiedUser,
         inlineCustomApiKey: customApiKey,
         requestedConnectionMode: connectionMode,
       });
       if (!resolved.ok) {
+        recordSafeAiAuditLog({
+          uid: verifiedUser?.uid || 'anonymous',
+          credentialSource: 'none',
+          model: plannedRouterModel,
+          operation: String(mode),
+          outcome: 'error',
+          errorCategory: resolved.classifiedError.errorCode,
+          latencyMs: Date.now() - startedAt,
+        });
         return res.status(resolved.classifiedError.httpStatus).json({
           ok: false,
           error: resolved.classifiedError.messageFa,
@@ -1774,6 +2179,7 @@ export function createArkaExpressApp() {
 
       const { ai, keySource } = resolved;
       const siteContext = await getLiveArkaSiteContext(false);
+      const canonicalBrand = getCanonicalOrgBrandProfile();
 
       const isJsonFlagActive =
         Boolean(jsonMode) ||
@@ -1793,11 +2199,20 @@ export function createArkaExpressApp() {
         modelDecision.requiredCapability
       );
       if (!capabilityCheck.supported) {
+        recordSafeAiAuditLog({
+          uid: verifiedUser?.uid || 'anonymous',
+          credentialSource: keySource,
+          model: modelDecision.modelId,
+          operation: String(mode),
+          outcome: 'error',
+          errorCategory: 'MODEL_UNSUPPORTED',
+          latencyMs: Date.now() - startedAt,
+        });
         return res.status(400).json({
           ok: false,
           error: capabilityCheck.reasonFa,
           errorDetails: {
-            errorCode: 'UNSUPPORTED_CAPABILITY',
+            errorCode: 'MODEL_UNSUPPORTED',
             httpStatus: 400,
             messageFa:
               capabilityCheck.reasonFa ||
@@ -1817,6 +2232,14 @@ export function createArkaExpressApp() {
             err429.status = 429;
             throw err429;
           }
+          recordSafeAiAuditLog({
+            uid: verifiedUser?.uid || 'anonymous',
+            credentialSource: keySource,
+            model: 'gemini-2.5-flash',
+            operation: String(mode),
+            outcome: 'success',
+            latencyMs: Date.now() - startedAt,
+          });
           return res.json({
             ok: true,
             mode,
@@ -1842,22 +2265,34 @@ export function createArkaExpressApp() {
         actualModelUsed: GeminiRouterModelId,
         usedFallback: boolean,
         fallbackReason?: string
-      ) => ({
-        selectedModel: actualModelUsed,
-        plannedModel: modelDecision.modelId,
-        usedFallback,
-        fallbackReason,
-        modelDisplayName: modelDecision.modelDisplayName,
-        detectedArkaMode: modelDecision.detectedArkaMode,
-        detectedSlashCommand: modelDecision.detectedSlashCommand,
-        reasoningFa: modelDecision.reasoningFa,
-        connectionMode,
-        keySource,
-        jsonModeActive: isJsonFlagActive,
-        liveContextCached: siteContext.cached,
-        liveContextFetchedLive: siteContext.fetchedLive,
-        latencyMs: Date.now() - startedAt,
-      });
+      ) => {
+        recordSafeAiAuditLog({
+          uid: verifiedUser?.uid || 'anonymous',
+          credentialSource: keySource,
+          model: actualModelUsed,
+          operation: String(mode),
+          outcome: 'success',
+          latencyMs: Date.now() - startedAt,
+        });
+        return {
+          selectedModel: actualModelUsed,
+          plannedModel: modelDecision.modelId,
+          usedFallback,
+          fallbackReason,
+          modelDisplayName: modelDecision.modelDisplayName,
+          detectedArkaMode: modelDecision.detectedArkaMode,
+          detectedSlashCommand: modelDecision.detectedSlashCommand,
+          reasoningFa: modelDecision.reasoningFa,
+          connectionMode,
+          keySource,
+          organizationId: CANONICAL_ARKA_ORG_ID,
+          canonicalBrandVersion: canonicalBrand.version || 1,
+          jsonModeActive: isJsonFlagActive,
+          liveContextCached: siteContext.cached,
+          liveContextFetchedLive: siteContext.fetchedLive,
+          latencyMs: Date.now() - startedAt,
+        };
+      };
 
       const slashDirective =
         activeSlash === 'fast'
@@ -1874,15 +2309,23 @@ export function createArkaExpressApp() {
           ? 'ماژول فعال: 6. Conversion Copywriting & Canvas Slide Engine (mode: "copy_engine" / /copy) — در data.copywriting: strategy، دقیقاً ۳ تیتر در headline_hooks، اسلایدهای structured_blocks، conversion_triggers و همچنین آرایه کامل canvas_slides آماده تزریق به StoryCanvas تولید کن.'
           : '';
 
-      const brandContextBlock = brandContextSummary
-        ? `\n[پروفایل قطب هوش برند کاربر (Brand Intelligence Hub)]:\n${brandContextSummary}\n`
-        : '';
+      const canonicalBrandBlock = `
+[پروفایل رسمی هوش برند سازمان آرکا (${CANONICAL_ARKA_ORG_ID} - نسخه v${canonicalBrand.version || 1})]:
+- نام برند: ${canonicalBrand.brandName}
+- شعار: ${canonicalBrand.tagline}
+- ارزش پیشنهادی اصلی: ${canonicalBrand.coreValueProposition}
+- مخاطبان هدف: ${canonicalBrand.targetAudienceSegments}
+- لحن رسمی: ${canonicalBrand.toneOfVoice}
+- تمایز رقابتی: ${canonicalBrand.competitivePositioning}
+- ادعاهای مجاز و مستند: ${canonicalBrand.approvedClaims || ''}
+- ستون‌های لینک‌سازی داخلی مجاز: ${canonicalBrand.internalLinkPillars}
+${brandContextSummary ? `- یادداشت تکمیلی جلسه: ${brandContextSummary}` : ''}`;
 
       const systemInstruction = `${ARKA_SYSTEM_INSTRUCTION}
 
 تمامی متن‌های فارسی باید ۱۰۰٪ به زبان فارسی سلیس، استاندارد، بدون غلط املایی و منحصراً بر اساس ویژگی‌های واقعی نرم‌افزار حسابداری آرکا (https://arka-acc.ir) شامل دموی رایگان ۱۰۰ سند، ۱ سال پشتیبانی رایگان، سرویس مستقیم سامانه مؤدیان، و ۸ سیستم تخصصی پاچال، سوله، ترخیص، منو، پروژه، ویترین، شتاب و پکیج جامع نوشته شوند.
 تلفن رسمی آرکا: 051-36079047 | وب‌سایت: arka-acc.ir | آدرس: مشهد، سید رضی ۴۰، پلاک ۲۶۵.
-${brandContextBlock}${slashDirective ? `\n${slashDirective}\n` : ''}
+${canonicalBrandBlock}${slashDirective ? `\n${slashDirective}\n` : ''}
 دانش زنده و کاتالوگ ۸ سیستم سایت آرکا:
 ${siteContext.summary}`;
 
@@ -1981,23 +2424,28 @@ ${siteContext.summary}`;
 
       // NEW MODULE: SEO / AEO / GEO Article Studio (mode === 'seo-article')
       if (mode === 'seo-article') {
+        const articleDepth = String(body.articleContentDepth || 'comprehensive');
+        const depthDirective =
+          articleDepth === 'pillar'
+            ? 'عمق محتوا: مقاله ستونی جامع (Pillar Content +3000 کلمه، حداقل ۶ بخش عمیق H2/H3 با تحلیل کامل اجرایی).'
+            : articleDepth === 'standard'
+            ? 'عمق محتوا: مقاله استاندارد سئو (۱۲۰۰ تا ۱۵۰۰ کلمه، ۵ بخش کاربردی H2/H3).'
+            : 'عمق محتوا: مقاله تخصصی جامع (۲۰۰۰ تا ۲۵۰۰ کلمه، حداقل ۵ بخش تحلیلی H2/H3).';
+
         const prompt = `یک مقاله جامع، عمیق و کاملاً بهینه‌شده برای موتورهای جستجو (SEO)، موتورهای پاسخ‌گو (AEO - Answer Engine Optimization) و موتورهای مولد هوش مصنوعی (GEO - Generative Engine Optimization) برای وب‌سایت رسمی گروه نرم‌افزاری آرکا (https://arka-acc.ir) با محوریت محصول «${productName}» بنویس.
 - مخاطب هدف: ${targetAudience}
 - هدف تجاری و CTA: ${campaignGoal}
 - لحن: ${tone}
 - کلمات کلیدی پیشنهادی کاربر: ${articleKeywords || productName}
 - نیت جستجوی هدف (Search Intent): ${articleSearchIntent || 'Commercial'}
+- ${depthDirective}
 ${customPrompt ? `- موضوع و نکات اختصاصی کاربر: ${customPrompt}` : ''}
 
-الزامات مقاله SEO / AEO / GEO:
-1. عنوان H1 جذاب، Meta Title استاندارد (تا ۶۰ کاراکتر)، Meta Description متقاعدکننده (۱۴۰ تا ۱۶۰ کاراکتر) و URL Slug انگلیسی.
-2. کلمه کلیدی اصلی + حداقل ۶ کلمه کلیدی فرعی و هم‌خانواده (LSI) + تحلیل فارسی نیت جستجوی کاربر.
-3. باکس پاسخ مستقیم (aeoDirectAnswerBox) در ۴۰ تا ۶۰ کلمه که دقیقاً به سوال اصلی کاربر پاسخ دهد تا در Featured Snippet گوگل و پاسخ‌های صوتی/هوشمند قرار بگیرد.
-4. خلاصه استنادی GEO (geoCitationSummary) شامل آمار و واقعیت‌های ساختاریافته آرکا (بیش از ۱۰ سال تجربه، دموی رایگان ۱۰۰ سند در arka-acc.ir/demo، ۱ سال پشتیبانی رایگان، اتصال مستقیم سامانه مؤدیان و ۸ زیرسیستم تخصصی) برای استناد در ChatGPT، Perplexity و Google AI Overviews.
-5. حداقل ۵ بخش ساختاریافته (H2 و H3) با پاراگراف‌های کامل، تخصصی و کاربردی به همراه نکته کلیدی هر بخش.
-6. حداقل ۴ پرسش و پاسخ متداول (FAQ Schema) دقیق.
-7. حداقل ۴ پیشنهاد لینک‌سازی داخلی با انکرتکست دقیق به صفحات واقعی https://arka-acc.ir ، https://arka-acc.ir/demo ، https://arka-acc.ir/products و https://arka-acc.ir/pages/tax .
-8. یک پست تخصصی لینکدین، یک کپشن اینستاگرام و یک اسلاید کاور مقاله (heroSlide) آماده تزریق به StoryCanvas.`;
+الزامات صداقت محتوایی و سئو (SEO / AEO / GEO Content Integrity):
+1. هرگز آمار، استناد، قابلیت محصول یا لینک داخلی جعلی نساز. فقط از صفحات واقعی سایت arka-acc.ir (شامل https://arka-acc.ir ، https://arka-acc.ir/demo ، https://arka-acc.ir/products ، https://arka-acc.ir/pages/tax ، https://arka-acc.ir/blog ، https://arka-acc.ir/academy ، https://arka-acc.ir/contact) استفاده کن.
+2. فکت‌های مستند آرکا (بیش از ۱۰ سال تجربه، دموی رایگان ۱۰۰ سند واقعی در arka-acc.ir/demo، ۱ سال پشتیبانی رایگان + آرکا آکادمی، اتصال مستقیم سامانه مؤدیان و ۸ سیستم تخصصی) را در آرایه verifiedArkaFacts قرار بده.
+3. هرگونه ادعای عمومی بازار یا قوانین مالیاتی که پیش از انتشار نیاز به تایید تحریریه یا مشاور مالیاتی دارد را به صورت شفاف در آرایه claimsRequiringVerification اعلام کن.
+4. باکس پاسخ مستقیم (aeoDirectAnswerBox) در ۴۰ تا ۶۰ کلمه و خلاصه استنادی (geoCitationSummary) را دقیق بنویس.`;
 
         const { response, actualModelUsed, usedFallback, fallbackReason } =
           await executeGeminiGeneration({
@@ -2014,6 +2462,21 @@ ${customPrompt ? `- موضوع و نکات اختصاصی کاربر: ${customPr
           });
 
         const parsed = extractSafeJson(response.text || '{}');
+        // Validate & sanitize internal links against real arka-acc.ir routes
+        if (Array.isArray(parsed.internalLinks)) {
+          parsed.internalLinks = parsed.internalLinks.map((lnk: any) => {
+            const check = validateArkaInternalUrl(lnk?.targetUrl);
+            return {
+              anchorText: String(lnk?.anchorText || 'نرم‌افزار حسابداری آرکا'),
+              targetUrl: check.normalizedUrl,
+              verifiedUrl: check.verifiedMatch,
+              placementContext: String(lnk?.placementContext || 'در متن مقاله'),
+            };
+          });
+        }
+        parsed.schemaRankingDisclaimerFa =
+          'نکته فنی سئو: داده‌های ساختاریافته (FAQ / Article Schema) به درک بهتر موتورهای جستجو و موتورهای پاسخ‌گو کمک می‌کنند، اما به‌تنهایی تضمین‌کننده جایگاه یا رتبه اول در نتایج گوگل نیستند.';
+
         return res.json({
           ok: true,
           mode: 'seo-article',

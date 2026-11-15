@@ -11,6 +11,11 @@ service cloud.firestore {
       return request.auth != null && request.auth.token.email_verified == true;
     }
 
+    function isBootstrappedAdmin() {
+      return isSignedIn()
+        && request.auth.token.email == 'amirrezaahmadynezhad@gmail.com';
+    }
+
     function isValidId(id) {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
@@ -25,6 +30,86 @@ service cloud.firestore {
 
     function isOwner(userId) {
       return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isCanonicalArkaOrg(orgId) {
+      return orgId == 'arka_org';
+    }
+
+    function isOrgMember(orgId) {
+      return isSignedIn()
+        && isCanonicalArkaOrg(orgId)
+        && (
+          isBootstrappedAdmin()
+          || exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid))
+        );
+    }
+
+    function canEditOrgBrandProfile(orgId) {
+      return isSignedIn()
+        && isCanonicalArkaOrg(orgId)
+        && (
+          isBootstrappedAdmin()
+          || (
+            exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid))
+            && get(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)).data.role in ['owner', 'admin', 'editor']
+          )
+        );
+    }
+
+    function isValidOrganizationRecord(data, orgId) {
+      return data.keys().hasAll(['orgId', 'name', 'ownerUid', 'updatedAt'])
+        && data.keys().hasOnly(['orgId', 'name', 'ownerUid', 'updatedAt'])
+        && data.orgId is string
+        && data.orgId == orgId
+        && data.orgId == 'arka_org'
+        && data.name is string
+        && data.name.size() >= 2
+        && data.name.size() <= 200
+        && data.ownerUid is string
+        && data.ownerUid.size() >= 1
+        && data.ownerUid.size() <= 128
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidOrganizationMemberRecord(data, orgId, userId) {
+      return data.keys().hasAll(['orgId', 'userId', 'email', 'role', 'updatedAt'])
+        && data.keys().hasOnly(['orgId', 'userId', 'email', 'role', 'updatedAt'])
+        && data.orgId is string
+        && data.orgId == orgId
+        && data.orgId == 'arka_org'
+        && data.userId is string
+        && data.userId == userId
+        && data.userId.size() >= 1
+        && data.userId.size() <= 128
+        && data.email is string
+        && data.email.size() >= 3
+        && data.email.size() <= 200
+        && data.role is string
+        && data.role in ['owner', 'admin', 'editor', 'viewer']
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidOrganizationBrandProfileRecord(data, orgId) {
+      return data.keys().hasAll(['orgId', 'version', 'updatedByUid', 'updatedByEmail', 'profileJson', 'updatedAt'])
+        && data.keys().hasOnly(['orgId', 'version', 'updatedByUid', 'updatedByEmail', 'profileJson', 'updatedAt'])
+        && data.orgId is string
+        && data.orgId == orgId
+        && data.orgId == 'arka_org'
+        && data.version is int
+        && data.version >= 1
+        && data.version <= 1000000
+        && data.updatedByUid is string
+        && data.updatedByUid == request.auth.uid
+        && data.updatedByUid.size() >= 1
+        && data.updatedByUid.size() <= 128
+        && data.updatedByEmail is string
+        && data.updatedByEmail.size() >= 3
+        && data.updatedByEmail.size() <= 200
+        && data.profileJson is string
+        && data.profileJson.size() >= 2
+        && data.profileJson.size() <= 25000
+        && data.updatedAt is timestamp;
     }
 
     function isValidAiGenerationRecord(data, userId) {
@@ -78,6 +163,43 @@ service cloud.firestore {
         || (settingId == 'brandProfile' && isValidBrandProfileRecord(data, userId));
     }
 
+    // Canonical Organization Root: /organizations/arka_org
+    match /organizations/{orgId} {
+      allow get: if isOrgMember(orgId) && isValidId(orgId);
+      allow create, update: if isBootstrappedAdmin()
+        && isValidId(orgId)
+        && isValidOrganizationRecord(incoming(), orgId)
+        && incoming().updatedAt == request.time;
+    }
+
+    // Organization Membership: /organizations/arka_org/members/{userId}
+    match /organizations/{orgId}/members/{userId} {
+      allow get: if isSignedIn()
+        && isCanonicalArkaOrg(orgId)
+        && isValidId(userId)
+        && (request.auth.uid == userId || isBootstrappedAdmin());
+      allow create, update: if isBootstrappedAdmin()
+        && isCanonicalArkaOrg(orgId)
+        && isValidId(userId)
+        && isValidOrganizationMemberRecord(incoming(), orgId, userId)
+        && incoming().updatedAt == request.time;
+      allow delete: if isBootstrappedAdmin()
+        && isCanonicalArkaOrg(orgId)
+        && isValidId(userId);
+    }
+
+    // Canonical Organization Brand Profile: /organizations/arka_org/settings/brandProfile
+    match /organizations/{orgId}/settings/{settingId} {
+      allow get: if isSignedIn()
+        && isCanonicalArkaOrg(orgId)
+        && settingId == 'brandProfile';
+      allow create, update: if canEditOrgBrandProfile(orgId)
+        && settingId == 'brandProfile'
+        && isValidOrganizationBrandProfileRecord(incoming(), orgId)
+        && incoming().updatedAt == request.time;
+    }
+
+    // Per-User AI Generation History
     match /users/{userId}/aiGenerations/{genId} {
       allow get: if isOwner(userId) && isValidId(userId) && isValidId(genId);
       allow list: if isOwner(userId) && existing().userId == request.auth.uid;
@@ -96,6 +218,7 @@ service cloud.firestore {
       allow delete: if isOwner(userId) && isValidId(userId) && isValidId(genId);
     }
 
+    // Per-User Personal Preferences (separated from canonical organization brand profile)
     match /users/{userId}/settings/{settingId} {
       allow get: if isOwner(userId) && isValidId(userId) && isValidId(settingId);
       allow create, update: if isOwner(userId)

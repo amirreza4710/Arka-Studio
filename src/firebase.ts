@@ -405,23 +405,46 @@ export async function fetchUserStudioPreferences(): Promise<UserStudioPreference
 
 export async function saveUserBrandProfile(
   profile: ArkaBrandProfile
-): Promise<void> {
+): Promise<ArkaBrandProfile> {
   const currentUser = auth.currentUser;
-  if (!currentUser) return;
+  if (!currentUser) {
+    return {
+      ...DEFAULT_ARKA_BRAND_PROFILE,
+      ...profile,
+      orgId: 'arka_org',
+    };
+  }
 
-  const path = `users/${currentUser.uid}/settings/brandProfile`;
-  const serialized = JSON.stringify(profile).slice(0, 18000);
+  const orgPath = 'organizations/arka_org/settings/brandProfile';
+  const nextVersion = Math.max(1, Number(profile.version || 1) + 1);
+  const updatedProfile: ArkaBrandProfile = {
+    ...DEFAULT_ARKA_BRAND_PROFILE,
+    ...profile,
+    orgId: 'arka_org',
+    version: nextVersion,
+    updatedByEmail: currentUser.email || 'admin@arka-acc.ir',
+    updatedAt: new Intl.DateTimeFormat('fa-IR', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date()),
+  };
+  const serialized = JSON.stringify(updatedProfile).slice(0, 24000);
+
   try {
-    await setDoc(
-      doc(db, 'users', currentUser.uid, 'settings', 'brandProfile'),
-      {
-        userId: currentUser.uid,
-        profileJson: serialized,
-        updatedAt: serverTimestamp(),
-      }
-    );
+    await setDoc(doc(db, 'organizations', 'arka_org', 'settings', 'brandProfile'), {
+      orgId: 'arka_org',
+      version: nextVersion,
+      updatedByUid: currentUser.uid,
+      updatedByEmail: String(currentUser.email || 'admin@arka-acc.ir').slice(0, 195),
+      profileJson: serialized,
+      updatedAt: serverTimestamp(),
+    });
+    return updatedProfile;
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
+    handleFirestoreError(error, OperationType.WRITE, orgPath);
   }
 }
 
@@ -429,20 +452,41 @@ export async function fetchUserBrandProfile(): Promise<ArkaBrandProfile | null> 
   const currentUser = auth.currentUser;
   if (!currentUser) return null;
 
-  const path = `users/${currentUser.uid}/settings/brandProfile`;
+  const orgPath = 'organizations/arka_org/settings/brandProfile';
   try {
-    const snap = await getDoc(
+    const orgSnap = await getDoc(
+      doc(db, 'organizations', 'arka_org', 'settings', 'brandProfile')
+    );
+    if (orgSnap.exists()) {
+      const data = orgSnap.data();
+      if (data?.profileJson) {
+        const parsed = JSON.parse(String(data.profileJson));
+        return {
+          ...DEFAULT_ARKA_BRAND_PROFILE,
+          ...parsed,
+          orgId: 'arka_org',
+          version: Number(data.version || parsed.version || 1),
+          updatedByEmail: String(data.updatedByEmail || parsed.updatedByEmail || ''),
+        };
+      }
+    }
+
+    // Safe, non-destructive backward-compatible fallback: inspect legacy /users/{uid}/settings/brandProfile
+    const legacySnap = await getDoc(
       doc(db, 'users', currentUser.uid, 'settings', 'brandProfile')
     );
-    if (!snap.exists()) return null;
-    const data = snap.data();
-    if (!data?.profileJson) return null;
-    const parsed = JSON.parse(String(data.profileJson));
+    if (!legacySnap.exists()) return null;
+    const legacyData = legacySnap.data();
+    if (!legacyData?.profileJson) return null;
+    const parsedLegacy = JSON.parse(String(legacyData.profileJson));
     return {
       ...DEFAULT_ARKA_BRAND_PROFILE,
-      ...parsed,
+      ...parsedLegacy,
+      orgId: 'arka_org',
+      version: Number(parsedLegacy.version || 1),
     };
   } catch (error) {
-    handleFirestoreError(error, OperationType.GET, path);
+    handleFirestoreError(error, OperationType.GET, orgPath);
   }
 }
+

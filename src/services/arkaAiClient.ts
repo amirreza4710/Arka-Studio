@@ -55,6 +55,7 @@ export interface GeneratedSeoArticleFaq {
 export interface GeneratedInternalLinkSuggestion {
   anchorText: string;
   targetUrl: string;
+  verifiedUrl?: boolean;
   placementContext: string;
 }
 
@@ -75,6 +76,9 @@ export interface GeneratedSeoArticleResult {
   internalLinks: GeneratedInternalLinkSuggestion[];
   linkedinPostSnippet: string;
   instagramCaptionSnippet: string;
+  verifiedArkaFacts?: string[];
+  claimsRequiringVerification?: string[];
+  schemaRankingDisclaimerFa?: string;
   heroSlide?: any;
 }
 
@@ -97,6 +101,7 @@ export function loadCachedBrandProfile(): ArkaBrandProfile {
         return {
           ...DEFAULT_ARKA_BRAND_PROFILE,
           ...parsed,
+          orgId: 'arka_org',
         };
       }
     }
@@ -111,7 +116,7 @@ export function saveCachedBrandProfile(profile: ArkaBrandProfile): void {
     if (typeof window !== 'undefined') {
       window.localStorage.setItem(
         BRAND_PROFILE_LOCAL_CACHE_KEY,
-        JSON.stringify(profile)
+        JSON.stringify({ ...profile, orgId: 'arka_org' })
       );
     }
   } catch {
@@ -166,6 +171,69 @@ function parseErrorPayload(
     suggestedFallbackModel: status === 429 ? 'gemini-2.5-flash' : null,
     retryAfterSeconds: data?.retryAfterSeconds,
   };
+}
+
+export async function fetchCanonicalOrgBrandProfile(): Promise<{
+  profile: ArkaBrandProfile;
+  canEditBrandProfile: boolean;
+  role: string;
+}> {
+  const headers = await buildAuthHeaders();
+  const resp = await fetch('/api/arka-org/brand-profile', {
+    method: 'GET',
+    headers,
+    cache: 'no-store',
+  });
+  const data = await resp.json();
+  if (!resp.ok || !data?.ok || !data?.profile) {
+    return {
+      profile: loadCachedBrandProfile(),
+      canEditBrandProfile: false,
+      role: 'viewer',
+    };
+  }
+  const merged: ArkaBrandProfile = {
+    ...DEFAULT_ARKA_BRAND_PROFILE,
+    ...data.profile,
+    orgId: 'arka_org',
+  };
+  saveCachedBrandProfile(merged);
+  return {
+    profile: merged,
+    canEditBrandProfile: Boolean(data.membership?.canEditBrandProfile),
+    role: String(data.membership?.role || 'viewer'),
+  };
+}
+
+export async function saveCanonicalOrgBrandProfile(
+  profile: ArkaBrandProfile
+): Promise<ArkaBrandProfile> {
+  const headers = await buildAuthHeaders();
+  const resp = await fetch('/api/arka-org/brand-profile', {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({
+      organizationId: 'arka_org',
+      profile,
+    }),
+  });
+  const data = await resp.json();
+  if (!resp.ok || !data?.ok || !data?.profile) {
+    throw new ArkaAiRequestError(
+      parseErrorPayload(
+        resp.status,
+        data,
+        'ذخیره پروفایل رسمی هوش برند سازمان آرکا (arka_org) ناموفق بود.'
+      )
+    );
+  }
+  const saved: ArkaBrandProfile = {
+    ...DEFAULT_ARKA_BRAND_PROFILE,
+    ...data.profile,
+    orgId: 'arka_org',
+  };
+  saveCachedBrandProfile(saved);
+  return saved;
 }
 
 export async function fetchByokVaultStatus(): Promise<ByokVaultStatus> {
@@ -306,6 +374,7 @@ export async function generateArkaStudioContent(params: {
   brandProfile?: ArkaBrandProfile;
   articleKeywords?: string;
   articleSearchIntent?: string;
+  articleContentDepth?: 'standard' | 'comprehensive' | 'pillar';
   allowModelFallback?: boolean;
 }): Promise<{
   mode: string;
@@ -319,6 +388,7 @@ export async function generateArkaStudioContent(params: {
     method: 'POST',
     headers,
     body: JSON.stringify({
+      organizationId: 'arka_org',
       mode: params.mode,
       productName: params.productName,
       targetAudience: params.targetAudience,
@@ -330,6 +400,7 @@ export async function generateArkaStudioContent(params: {
       allowModelFallback: Boolean(params.allowModelFallback),
       articleKeywords: params.articleKeywords || '',
       articleSearchIntent: params.articleSearchIntent || 'Commercial',
+      articleContentDepth: params.articleContentDepth || 'comprehensive',
       brandContextSummary: `هویت برند: ${activeBrand.brandName} (${activeBrand.websiteUrl}) | ارزش پیشنهادی: ${activeBrand.coreValueProposition} | مخاطبان هدف: ${activeBrand.targetAudienceSegments} | لحن برند: ${activeBrand.toneOfVoice} | تمایز رقابتی: ${activeBrand.competitivePositioning} | اهداف مارکتینگ: ${activeBrand.marketingObjectives} | کلمات کلیدی کانونی: ${activeBrand.focusKeywords} | صفحات ستونی لینک‌سازی داخلی: ${activeBrand.internalLinkPillars}`,
     }),
   });
@@ -351,3 +422,4 @@ export async function generateArkaStudioContent(params: {
     result: data.result,
   };
 }
+

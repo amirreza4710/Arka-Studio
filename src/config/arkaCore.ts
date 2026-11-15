@@ -158,6 +158,18 @@ export function validateModelCapabilityForTask(
   return { supported: true };
 }
 
+export const CANONICAL_ARKA_ORG_ID = 'arka_org' as const;
+
+export type ArkaOrgRole = 'owner' | 'admin' | 'editor' | 'viewer';
+
+export interface ArkaOrganizationMember {
+  uid: string;
+  email: string;
+  role: ArkaOrgRole;
+  orgId: typeof CANONICAL_ARKA_ORG_ID;
+  canEditBrandProfile: boolean;
+}
+
 export type ArkaAiErrorCode =
   | 'INVALID_API_KEY'
   | 'AUTH_REQUIRED'
@@ -165,11 +177,15 @@ export type ArkaAiErrorCode =
   | 'PERMISSION_DENIED'
   | 'QUOTA_EXCEEDED'
   | 'MODEL_UNAVAILABLE'
+  | 'MODEL_UNSUPPORTED'
   | 'UNSUPPORTED_CAPABILITY'
   | 'RATE_LIMITED'
   | 'VALIDATION_ERROR'
+  | 'NETWORK_ERROR'
   | 'NETWORK_TIMEOUT'
-  | 'UPSTREAM_ERROR';
+  | 'PROVIDER_ERROR'
+  | 'UPSTREAM_ERROR'
+  | 'INTERNAL_ERROR';
 
 export interface ClassifiedAiError {
   errorCode: ArkaAiErrorCode;
@@ -184,6 +200,10 @@ export interface ClassifiedAiError {
 }
 
 export interface ArkaBrandProfile {
+  orgId?: string;
+  version?: number;
+  updatedAt?: string;
+  updatedByEmail?: string;
   brandName: string;
   tagline: string;
   websiteUrl: string;
@@ -199,9 +219,56 @@ export interface ArkaBrandProfile {
   marketingObjectives: string;
   focusKeywords: string;
   internalLinkPillars: string;
+  approvedClaims?: string;
+  systemsCatalogSummary?: string;
+}
+
+export const VERIFIED_ARKA_INTERNAL_URLS: ReadonlyArray<{
+  url: string;
+  labelFa: string;
+}> = [
+  { url: 'https://arka-acc.ir', labelFa: 'صفحه اصلی گروه نرم‌افزاری آرکا' },
+  { url: 'https://arka-acc.ir/demo', labelFa: 'دانلود نسخه دموی رایگان ۱۰۰ سند واقعی' },
+  { url: 'https://arka-acc.ir/products', labelFa: 'کاتالوگ ۸ سیستم یکپارچه حسابداری آرکا' },
+  { url: 'https://arka-acc.ir/pages/tax', labelFa: 'سرویس اتصال مستقیم به سامانه مؤدیان مالیاتی' },
+  { url: 'https://arka-acc.ir/blog', labelFa: 'مجله تخصصی مالی، مالیاتی و حسابداری آرکا' },
+  { url: 'https://arka-acc.ir/academy', labelFa: 'آرکا آکادمی (ویدیوهای آموزشی رایگان)' },
+  { url: 'https://arka-acc.ir/about', labelFa: 'درباره گروه نرم‌افزاری آرکا' },
+  { url: 'https://arka-acc.ir/contact', labelFa: 'تماس با آرکا و مشاوره رایگان (۰۵۱۳۶۰۷۹۰۴۷)' },
+];
+
+export function validateArkaInternalUrl(rawUrl: string): {
+  valid: boolean;
+  normalizedUrl: string;
+  verifiedMatch: boolean;
+} {
+  const trimmed = String(rawUrl || '').trim().replace(/\/+$/, '');
+  if (!trimmed) {
+    return {
+      valid: false,
+      normalizedUrl: 'https://arka-acc.ir/products',
+      verifiedMatch: false,
+    };
+  }
+  const exact = VERIFIED_ARKA_INTERNAL_URLS.find(
+    (u) => u.url.toLowerCase() === trimmed.toLowerCase()
+  );
+  if (exact) {
+    return { valid: true, normalizedUrl: exact.url, verifiedMatch: true };
+  }
+  if (trimmed.toLowerCase().startsWith('https://arka-acc.ir')) {
+    return { valid: true, normalizedUrl: trimmed, verifiedMatch: false };
+  }
+  return {
+    valid: false,
+    normalizedUrl: 'https://arka-acc.ir/products',
+    verifiedMatch: false,
+  };
 }
 
 export const DEFAULT_ARKA_BRAND_PROFILE: ArkaBrandProfile = {
+  orgId: CANONICAL_ARKA_ORG_ID,
+  version: 1,
   brandName: 'گروه نرم‌افزاری آرکا (Arka Software Group)',
   tagline: 'راهنمای هوشمند کسب‌وکار · یکپارچگی کامل برای تصمیم‌گیری سریع‌تر و دقیق‌تر',
   websiteUrl: 'https://arka-acc.ir',
@@ -225,6 +292,10 @@ export const DEFAULT_ARKA_BRAND_PROFILE: ArkaBrandProfile = {
     'نرم افزار حسابداری آرکا، ارسال صورتحساب سامانه مودیان، دانلود رایگان نرم افزار حسابداری، نرم افزار حسابداری فروشگاهی پاچال، حسابداری تولیدی سوله، حسابداری آنلاین شاپ ویترین',
   internalLinkPillars:
     'https://arka-acc.ir (صفحه اصلی) | https://arka-acc.ir/demo (دموی رایگان ۱۰۰ سند) | https://arka-acc.ir/products (کاتالوگ ۸ سیستم) | https://arka-acc.ir/pages/tax (سرویس سامانه مؤدیان)',
+  approvedClaims:
+    'بیش از ۱۰ سال تجربه تخصصی | دموی رایگان ۱۰۰ سند واقعی بدون محدودیت زمانی | ۱ سال پشتیبانی رایگان + آرکا آکادمی | ارسال مستقیم صورتحساب الکترونیکی به سامانه مؤدیان | مطالعه موردی واقعی: شرکت رنگ بهارستان',
+  systemsCatalogSummary:
+    '۱. پکیج جامع مالی آرکا | ۲. حسابداری فروشگاهی پاچال | ۳. حسابداری تولیدی و انبار سوله | ۴. حسابداری بازرگانی ترخیص | ۵. حسابداری رستورانی منو | ۶. حسابداری شرکتی و پیمانکاری پروژه | ۷. حسابداری آنلاین‌شاپ ویترین | ۸. حسابداری استارتاپی شتاب',
 };
 
 export interface SlashCommandConfig {

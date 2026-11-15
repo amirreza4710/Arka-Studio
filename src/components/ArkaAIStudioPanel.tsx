@@ -24,6 +24,7 @@ import {
   ClassifiedAiError,
   ArkaBrandProfile,
   DEFAULT_ARKA_BRAND_PROFILE,
+  CANONICAL_ARKA_ORG_ID,
   resolveSmartModelForTask,
 } from '../config/arkaCore';
 import {
@@ -32,6 +33,8 @@ import {
   generateArkaStudioContent,
   loadCachedBrandProfile,
   saveCachedBrandProfile,
+  fetchCanonicalOrgBrandProfile,
+  saveCanonicalOrgBrandProfile,
   verifyArkaAiConnection,
 } from '../services/arkaAiClient';
 import {
@@ -209,12 +212,17 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
   const [articleSearchIntent, setArticleSearchIntent] = useState<
     'Commercial' | 'Informational' | 'Transactional' | 'Navigational'
   >('Commercial');
+  const [articleContentDepth, setArticleContentDepth] = useState<
+    'standard' | 'comprehensive' | 'pillar'
+  >('comprehensive');
 
-  // Brand Intelligence Hub State
+  // Brand Intelligence Hub State (Canonical Organization: arka_org)
   const [showBrandHub, setShowBrandHub] = useState<boolean>(false);
   const [brandProfile, setBrandProfile] = useState<ArkaBrandProfile>(() =>
     loadCachedBrandProfile()
   );
+  const [orgRole, setOrgRole] = useState<string>('viewer');
+  const [canEditOrgBrand, setCanEditOrgBrand] = useState<boolean>(true);
   const [isSavingBrandProfile, setIsSavingBrandProfile] =
     useState<boolean>(false);
   const [brandSavedBanner, setBrandSavedBanner] = useState<string | null>(null);
@@ -261,8 +269,23 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     setConnectionMode(preferredConnectionMode);
   }, [preferredConnectionMode]);
 
-  // Load user's cloud Brand Intelligence Hub profile when signed in
+  // Load canonical organization Brand Intelligence Hub profile (arka_org) when signed in or on mount
   useEffect(() => {
+    fetchCanonicalOrgBrandProfile()
+      .then((orgData) => {
+        if (orgData?.profile) {
+          setBrandProfile(orgData.profile);
+          saveCachedBrandProfile(orgData.profile);
+        }
+        if (orgData?.role) {
+          setOrgRole(orgData.role);
+          setCanEditOrgBrand(orgData.canEditBrandProfile);
+        }
+      })
+      .catch(() => {
+        // Fallback to Firestore/local cached profile
+      });
+
     if (!currentUser) return;
     fetchUserBrandProfile()
       .then((cloudProfile) => {
@@ -283,21 +306,27 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     try {
       saveCachedBrandProfile(brandProfile);
       if (currentUser) {
-        await saveUserBrandProfile(brandProfile);
+        const savedProfile = await saveCanonicalOrgBrandProfile(brandProfile);
+        setBrandProfile(savedProfile);
+        await saveUserBrandProfile(savedProfile).catch(() => {});
       }
       setBrandSavedBanner(
         currentUser
-          ? 'پروفایل قطب هوش برند آرکا در فضای ابری حساب شما ذخیره شد و در تمام ماژول‌ها فعال است.'
+          ? `پروفایل رسمی برند سازمان (${CANONICAL_ARKA_ORG_ID}) در فضای ابری ذخیره شد و در تمام ماژول‌ها فعال است.`
           : 'پروفایل قطب هوش برند در مرورگر ذخیره شد و در تمام ماژول‌ها فعال است.'
       );
       onEmitTelemetryLog?.(
         'ok',
         'LiveContext',
-        `پروفایل قطب هوش برند (${brandProfile.brandName}) بروزرسانی شد.`
+        `پروفایل قطب هوش برند سازمان (${CANONICAL_ARKA_ORG_ID} · ${brandProfile.brandName}) بروزرسانی شد.`
       );
       setTimeout(() => setBrandSavedBanner(null), 3500);
-    } catch {
-      setBrandSavedBanner('ذخیره محلی انجام شد.');
+    } catch (err: any) {
+      if (err instanceof ArkaAiRequestError) {
+        setBrandSavedBanner(err.classified.messageFa);
+      } else {
+        setBrandSavedBanner('ذخیره محلی انجام شد.');
+      }
     } finally {
       setIsSavingBrandProfile(false);
     }
@@ -306,7 +335,8 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
   const handleResetBrandHubToDefault = () => {
     setBrandProfile({ ...DEFAULT_ARKA_BRAND_PROFILE });
     saveCachedBrandProfile(DEFAULT_ARKA_BRAND_PROFILE);
-    if (currentUser) {
+    if (currentUser && canEditOrgBrand) {
+      saveCanonicalOrgBrandProfile(DEFAULT_ARKA_BRAND_PROFILE).catch(() => {});
       saveUserBrandProfile(DEFAULT_ARKA_BRAND_PROFILE).catch(() => {});
     }
     setBrandSavedBanner('پروفایل قطب هوش برند به استاندارد کارخانه آرکا بازنشانی شد.');
@@ -633,6 +663,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
         brandProfile,
         articleKeywords,
         articleSearchIntent,
+        articleContentDepth,
         allowModelFallback,
       });
 
@@ -1330,8 +1361,17 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
               </div>
             </div>
 
+            <div className="p-2.5 rounded-xl bg-[#062959] text-white flex flex-wrap items-center justify-between gap-2 text-[11px]">
+              <span className="font-bold text-[#14dac3]">
+                سازمان رسمی: <strong dir="ltr">{CANONICAL_ARKA_ORG_ID}</strong> · نسخه v{brandProfile.version || 1}
+              </span>
+              <span className="px-2 py-0.5 rounded bg-white/10 text-slate-200 font-mono text-[10px]">
+                Role: {currentUser ? orgRole : 'local-session'}
+              </span>
+            </div>
+
             <p className="text-[11px] text-[#7e8c9b] leading-relaxed">
-              اطلاعات این بخش به‌صورت خودکار در تمام ماژول‌های تولید محتوا (مقاله SEO/AEO/GEO، تقویم کمپین، اسلاید بوم، کاروسل و ریلز) تزریق می‌شود تا خروجی‌ها کاملاً هم‌راستا با هویت برند شما باشند.
+              پروفایل هوش برند در سطح سازمانی ({CANONICAL_ARKA_ORG_ID}) نگهداری می‌شود و به‌صورت خودکار در تمام ماژول‌های تولید محتوا (مقاله SEO/AEO/GEO، تقویم کمپین، اسلاید بوم، کاروسل و ریلز) تزریق می‌گردد. ترجیحات شخصی کاربران هرگز هویت رسمی سازمان را بازنویسی نمی‌کند.
             </p>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -1658,6 +1698,34 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                           }`}
                         >
                           {intent.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                      عمق محتوایی مقاله (Content Depth):
+                    </label>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {(
+                        [
+                          { id: 'standard', label: 'استاندارد (۴ بخش)' },
+                          { id: 'comprehensive', label: 'جامع تخصصی (۶ بخش)' },
+                          { id: 'pillar', label: 'مرجع کامل Pillar' },
+                        ] as const
+                      ).map((depthOpt) => (
+                        <button
+                          key={depthOpt.id}
+                          type="button"
+                          onClick={() => setArticleContentDepth(depthOpt.id)}
+                          className={`px-2 py-1.5 rounded-lg text-[10px] font-bold border cursor-pointer transition-colors ${
+                            articleContentDepth === depthOpt.id
+                              ? 'bg-purple-500 text-white border-purple-400 font-black'
+                              : 'bg-[#0F1420] text-slate-300 border-slate-700 hover:border-slate-500'
+                          }`}
+                        >
+                          {depthOpt.label}
                         </button>
                       ))}
                     </div>
@@ -2336,8 +2404,57 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                               </div>
                             ))}
                           </div>
+                          {aiResult.schemaRankingDisclaimerFa && (
+                            <div className="p-2 rounded-lg bg-amber-50 border border-amber-200 text-[10px] text-amber-800 leading-relaxed">
+                              ⚠️ {aiResult.schemaRankingDisclaimerFa}
+                            </div>
+                          )}
                         </div>
                       )}
+
+                    {/* Verified Arka Facts vs Editorial Verification Claims */}
+                    {(Array.isArray(aiResult.verifiedArkaFacts) ||
+                      Array.isArray(aiResult.claimsRequiringVerification)) && (
+                      <div className="grid grid-cols-1 gap-2.5 text-xs">
+                        {Array.isArray(aiResult.verifiedArkaFacts) &&
+                          aiResult.verifiedArkaFacts.length > 0 && (
+                            <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 space-y-1.5">
+                              <div className="font-black text-emerald-900 flex items-center gap-1.5">
+                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                                <span>
+                                  فکت‌های تاییدشده از کاتالوگ رسمی آرکا (Verified Facts):
+                                </span>
+                              </div>
+                              <ul className="list-disc list-inside space-y-1 text-[11px] text-emerald-800">
+                                {aiResult.verifiedArkaFacts.map(
+                                  (fact: string, fIdx: number) => (
+                                    <li key={fIdx}>{fact}</li>
+                                  )
+                                )}
+                              </ul>
+                            </div>
+                          )}
+
+                        {Array.isArray(aiResult.claimsRequiringVerification) &&
+                          aiResult.claimsRequiringVerification.length > 0 && (
+                            <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 space-y-1.5">
+                              <div className="font-black text-amber-900 flex items-center gap-1.5">
+                                <ShieldAlert className="w-3.5 h-3.5 text-amber-600" />
+                                <span>
+                                  نکات نیازمند بازبینی تحریریه پیش از انتشار (Editorial Check):
+                                </span>
+                              </div>
+                              <ul className="list-disc list-inside space-y-1 text-[11px] text-amber-800">
+                                {aiResult.claimsRequiringVerification.map(
+                                  (claim: string, cIdx: number) => (
+                                    <li key={cIdx}>{claim}</li>
+                                  )
+                                )}
+                              </ul>
+                            </div>
+                          )}
+                      </div>
+                    )}
 
                     {/* LinkedIn & Instagram Distribution Snippets */}
                     {(aiResult.linkedinPostSnippet ||

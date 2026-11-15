@@ -1,5 +1,95 @@
 {
   "entities": {
+    "OrganizationRecord": {
+      "title": "OrganizationRecord",
+      "description": "Canonical Arka organization root document (arka_org).",
+      "type": "object",
+      "properties": {
+        "orgId": {
+          "type": "string",
+          "enum": ["arka_org"]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 200
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["orgId", "name", "ownerUid", "updatedAt"]
+    },
+    "OrganizationMemberRecord": {
+      "title": "OrganizationMemberRecord",
+      "description": "Organization membership and RBAC role assignment inside arka_org.",
+      "type": "object",
+      "properties": {
+        "orgId": {
+          "type": "string",
+          "enum": ["arka_org"]
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "role": {
+          "type": "string",
+          "enum": ["owner", "admin", "editor", "viewer"]
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["orgId", "userId", "email", "role", "updatedAt"]
+    },
+    "OrganizationBrandProfileRecord": {
+      "title": "OrganizationBrandProfileRecord",
+      "description": "Single canonical organization-level Arka Brand Profile (versioned) under /organizations/arka_org/settings/brandProfile.",
+      "type": "object",
+      "properties": {
+        "orgId": {
+          "type": "string",
+          "enum": ["arka_org"]
+        },
+        "version": {
+          "type": "number"
+        },
+        "updatedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "updatedByEmail": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "profileJson": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 25000
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["orgId", "version", "updatedByUid", "updatedByEmail", "profileJson", "updatedAt"]
+    },
     "AiGenerationRecord": {
       "title": "AiGenerationRecord",
       "description": "Stores AI-generated Instagram scenarios, slides, captions, SEO/AEO/GEO articles, and sales campaigns created by a signed-in Google user in Arka Studio.",
@@ -78,7 +168,7 @@
     },
     "BrandProfileRecord": {
       "title": "BrandProfileRecord",
-      "description": "Per-user reusable Brand Intelligence Hub profile for Arka Studio content generation.",
+      "description": "Legacy per-user brand profile record preserved for non-destructive backward-compatible migration to /organizations/arka_org/settings/brandProfile.",
       "type": "object",
       "properties": {
         "userId": {
@@ -100,13 +190,25 @@
     }
   },
   "firestore": {
+    "/organizations/{orgId}": {
+      "schema": { "$ref": "#/entities/OrganizationRecord" },
+      "description": "Canonical organization document (arka_org)."
+    },
+    "/organizations/{orgId}/members/{userId}": {
+      "schema": { "$ref": "#/entities/OrganizationMemberRecord" },
+      "description": "Organization membership & role assignment records for arka_org."
+    },
+    "/organizations/{orgId}/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/OrganizationBrandProfileRecord" },
+      "description": "Canonical organization-level Arka Brand Profile (brandProfile)."
+    },
     "/users/{userId}/aiGenerations/{genId}": {
       "schema": { "$ref": "#/entities/AiGenerationRecord" },
       "description": "Private per-user collection of AI-generated Arka campaigns, SEO/AEO/GEO articles, Reels scripts, and slides."
     },
     "/users/{userId}/settings/{settingId}": {
       "schema": { "$ref": "#/entities/UserPreferenceRecord" },
-      "description": "Private per-user settings documents (preferences and brandProfile)."
+      "description": "Private per-user settings documents (preferences, plus legacy read-compatible brandProfile)."
     }
   }
 }
