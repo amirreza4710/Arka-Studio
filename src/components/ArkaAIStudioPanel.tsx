@@ -12,7 +12,8 @@ import {
   fetchUserAiGenerations,
   deleteUserAiGeneration,
   getAccessToken,
-  getFirebaseIdToken,
+  fetchUserBrandProfile,
+  saveUserBrandProfile,
 } from '../firebase';
 import {
   ARKA_SLASH_COMMANDS,
@@ -20,8 +21,19 @@ import {
   SlashCommandConfig,
   ArkaConnectionSource,
   CanvasSlideSchemaItem,
+  ClassifiedAiError,
+  ArkaBrandProfile,
+  DEFAULT_ARKA_BRAND_PROFILE,
   resolveSmartModelForTask,
 } from '../config/arkaCore';
+import {
+  ArkaAiRequestError,
+  GeneratedSeoArticleResult,
+  generateArkaStudioContent,
+  loadCachedBrandProfile,
+  saveCachedBrandProfile,
+  verifyArkaAiConnection,
+} from '../services/arkaAiClient';
 import {
   Sparkles,
   Film,
@@ -39,7 +51,6 @@ import {
   LogOut,
   Trash2,
   History,
-  Globe,
   Loader2,
   CheckCircle2,
   AlertCircle,
@@ -52,6 +63,12 @@ import {
   Video,
   MessageSquareText,
   Zap,
+  FileText,
+  BrainCircuit,
+  Link2,
+  HelpCircle,
+  Share2,
+  RotateCcw,
 } from 'lucide-react';
 
 export interface Generated30DayScheduleItem {
@@ -102,6 +119,7 @@ interface GeneratedSlidePayload {
 
 export interface CustomKeyVerifiedInfo {
   valid: boolean;
+  maskedKey?: string | null;
   models: string[];
   hasPro: boolean;
   hasFlash: boolean;
@@ -140,7 +158,6 @@ interface ArkaAIStudioPanelProps {
   }) => void;
   preferredConnectionMode?: ArkaConnectionSource;
   onChangeConnectionMode?: (mode: ArkaConnectionSource) => void;
-  customApiKey?: string;
   customKeyVerifiedInfo?: CustomKeyVerifiedInfo | null;
   onOpenAuthKeyModal?: () => void;
   onEmitTelemetryLog?: (
@@ -168,7 +185,6 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
   onWriteStructuredToSheet,
   preferredConnectionMode = 'studio-creator-core',
   onChangeConnectionMode,
-  customApiKey = '',
   customKeyVerifiedInfo = null,
   onOpenAuthKeyModal,
   onEmitTelemetryLog,
@@ -187,6 +203,22 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     'حرفه‌ای، خلاقانه، متقاعدکننده و منطبق با بازار ایران'
   );
   const [customPrompt, setCustomPrompt] = useState<string>('');
+  const [articleKeywords, setArticleKeywords] = useState<string>(
+    'نرم افزار حسابداری آرکا، ارسال صورتحساب سامانه مودیان، دانلود دموی رایگان حسابداری'
+  );
+  const [articleSearchIntent, setArticleSearchIntent] = useState<
+    'Commercial' | 'Informational' | 'Transactional' | 'Navigational'
+  >('Commercial');
+
+  // Brand Intelligence Hub State
+  const [showBrandHub, setShowBrandHub] = useState<boolean>(false);
+  const [brandProfile, setBrandProfile] = useState<ArkaBrandProfile>(() =>
+    loadCachedBrandProfile()
+  );
+  const [isSavingBrandProfile, setIsSavingBrandProfile] =
+    useState<boolean>(false);
+  const [brandSavedBanner, setBrandSavedBanner] = useState<string | null>(null);
+
   const [activeSlashCommand, setActiveSlashCommand] = useState<string | null>(
     null
   );
@@ -229,6 +261,58 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     setConnectionMode(preferredConnectionMode);
   }, [preferredConnectionMode]);
 
+  // Load user's cloud Brand Intelligence Hub profile when signed in
+  useEffect(() => {
+    if (!currentUser) return;
+    fetchUserBrandProfile()
+      .then((cloudProfile) => {
+        if (cloudProfile) {
+          setBrandProfile(cloudProfile);
+          saveCachedBrandProfile(cloudProfile);
+        }
+      })
+      .catch(() => {
+        // Keep cached default profile
+      });
+  }, [currentUser]);
+
+  const handleSaveBrandHubProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSavingBrandProfile(true);
+    setBrandSavedBanner(null);
+    try {
+      saveCachedBrandProfile(brandProfile);
+      if (currentUser) {
+        await saveUserBrandProfile(brandProfile);
+      }
+      setBrandSavedBanner(
+        currentUser
+          ? 'پروفایل قطب هوش برند آرکا در فضای ابری حساب شما ذخیره شد و در تمام ماژول‌ها فعال است.'
+          : 'پروفایل قطب هوش برند در مرورگر ذخیره شد و در تمام ماژول‌ها فعال است.'
+      );
+      onEmitTelemetryLog?.(
+        'ok',
+        'LiveContext',
+        `پروفایل قطب هوش برند (${brandProfile.brandName}) بروزرسانی شد.`
+      );
+      setTimeout(() => setBrandSavedBanner(null), 3500);
+    } catch {
+      setBrandSavedBanner('ذخیره محلی انجام شد.');
+    } finally {
+      setIsSavingBrandProfile(false);
+    }
+  };
+
+  const handleResetBrandHubToDefault = () => {
+    setBrandProfile({ ...DEFAULT_ARKA_BRAND_PROFILE });
+    saveCachedBrandProfile(DEFAULT_ARKA_BRAND_PROFILE);
+    if (currentUser) {
+      saveUserBrandProfile(DEFAULT_ARKA_BRAND_PROFILE).catch(() => {});
+    }
+    setBrandSavedBanner('پروفایل قطب هوش برند به استاندارد کارخانه آرکا بازنشانی شد.');
+    setTimeout(() => setBrandSavedBanner(null), 3000);
+  };
+
   const handleSelectConnectionMode = (nextMode: ArkaConnectionSource) => {
     setConnectionMode(nextMode);
     if (onChangeConnectionMode) {
@@ -236,10 +320,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     }
   };
 
-  // Determine effective active credit source strictly for transparent HUD display
-  const hasVerifiedByok = Boolean(
-    customApiKey.trim() && customKeyVerifiedInfo?.valid
-  );
+  const hasVerifiedByok = Boolean(customKeyVerifiedInfo?.valid);
   const isGmailActive = Boolean(
     currentUser && connectionMode === 'gmail-authenticated'
   );
@@ -250,24 +331,21 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
   const creditSourceDisplay = isByokActive
     ? {
         dot: '🔵',
-        badgeClass:
-          'bg-cyan-500/15 text-cyan-300 border-cyan-500/40',
-        label: 'کلید API اختصاصی تاییدشده شما (BYOK)',
-        short: 'کلید شخصی شما',
+        badgeClass: 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40',
+        label: `گاوصندوق کلید شخصی (${customKeyVerifiedInfo?.maskedKey || 'فعال'})`,
+        short: 'گاوصندوق کلید شخصی',
       }
     : isGmailActive
     ? {
         dot: '🟢',
-        badgeClass:
-          'bg-emerald-500/15 text-emerald-300 border-emerald-500/40',
-        label: `اکانت جیمیل شخصی شما (${currentUser?.email || ''})`,
+        badgeClass: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40',
+        label: `اکانت جیمیل (${currentUser?.email || ''})`,
         short: 'اکانت جیمیل',
       }
     : {
         dot: '🟠',
-        badgeClass:
-          'bg-amber-500/15 text-amber-300 border-amber-500/40',
-        label: 'کلید پیش‌فرض سازمانی استودیو آرکا',
+        badgeClass: 'bg-amber-500/15 text-amber-300 border-amber-500/40',
+        label: 'کلید سازمانی سرور آرکا (ویژه ادمین)',
         short: 'هسته سازمانی آرکا',
       };
 
@@ -279,10 +357,11 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
 
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [classifiedError, setClassifiedError] =
+    useState<ClassifiedAiError | null>(null);
   const [aiResult, setAiResult] = useState<any | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  // Live site sync status (6h cache)
   const [isSyncingSite, setIsSyncingSite] = useState<boolean>(false);
   const [siteSyncStatus, setSiteSyncStatus] = useState<{
     fetchedLive: boolean;
@@ -291,11 +370,9 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     updatedAt: string;
   } | null>(null);
 
-  // Cloud saved generations for logged-in Gmail user
   const [savedHistory, setSavedHistory] = useState<SavedAiGenerationItem[]>([]);
   const [showHistory, setShowHistory] = useState<boolean>(false);
 
-  // 30-Day AI Campaign Calendar filter & Google Drive Spreadsheet export state
   const [selectedWeekFilter, setSelectedWeekFilter] = useState<number>(0);
   const [isConfirmingDriveSave, setIsConfirmingDriveSave] =
     useState<boolean>(false);
@@ -328,21 +405,23 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
             'ok',
             'LiveContext',
             `کاتالوگ ${data.systemsCount || 8} سیستم آرکا آماده است (${
-              data.cached ? 'کش ۶ ساعته' : data.fetchedLive ? 'واکشی زنده از arka-acc.ir' : 'دانش استاتیک پشتیبان'
+              data.cached
+                ? 'کش ۶ ساعته'
+                : data.fetchedLive
+                ? 'واکشی زنده از arka-acc.ir'
+                : 'دانش استاتیک پشتیبان'
             }).`
           );
         }
       })
-      .catch(() => {
-        // Ignore initial ping error
-      });
+      .catch(() => {});
 
     fetch('/api/arka-ai/diagnostics')
       .then((r) => r.json())
       .then((diag) => {
         if (diag?.ok && diag?.recommendedDecision) {
           setConnectionDiagnostics({
-            verified: Boolean(diag.serverKeyConfigured),
+            verified: Boolean(diag.serverKeyConfigured || diag.userVaultConfigured),
             selectedModel: diag.recommendedDecision.modelId,
             modelDisplayName: diag.recommendedDecision.modelDisplayName,
             reasoningFa: diag.recommendedDecision.reasoningFa,
@@ -353,18 +432,14 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
           });
         }
       })
-      .catch(() => {
-        // Ignore
-      });
+      .catch(() => {});
   }, [onEmitTelemetryLog]);
 
   useEffect(() => {
     if (currentUser) {
       fetchUserAiGenerations()
         .then((items) => setSavedHistory(items))
-        .catch(() => {
-          // Ignore
-        });
+        .catch(() => {});
     } else {
       setSavedHistory([]);
     }
@@ -410,37 +485,13 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     if (isVerifyingConnection) return;
     setIsVerifyingConnection(true);
     setErrorMsg(null);
+    setClassifiedError(null);
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      };
-      if (!isByokActive) {
-        const idToken = await getFirebaseIdToken();
-        if (!idToken) {
-          const authMsg = 'برای استفاده وارد شوید یا کلید شخصی ثبت کنید';
-          setErrorMsg(authMsg);
-          onEmitTelemetryLog?.('warn', 'Auth', authMsg);
-          return;
-        }
-        headers.Authorization = `Bearer ${idToken}`;
-      }
-
-      const resp = await fetch('/api/arka-ai/verify-connection', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          connectionMode,
-          customApiKey: isByokActive ? customApiKey : '',
-          customPrompt,
-          studioTabMode: mode,
-        }),
+      const data = await verifyArkaAiConnection({
+        connectionMode,
+        customPrompt,
+        studioTabMode: mode,
       });
-      const data = await resp.json();
-      if (!resp.ok || !data?.ok) {
-        throw new Error(
-          data?.error || 'اعتبارسنجی اتصال سرویس هوش مصنوعی ناموفق بود.'
-        );
-      }
       setConnectionDiagnostics({
         verified: true,
         latencyMs: data.latencyMs,
@@ -457,14 +508,22 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
         'ok',
         'AI-Router',
         `تست اتصال موفق (${data.latencyMs}ms) · مدل فعال: ${data.selectedModel} · منبع: ${
-          data.keySource === 'custom-byok' ? 'کلید شخصی BYOK' : 'هسته سازمانی آرکا'
+          data.keySource === 'vault-byok'
+            ? 'گاوصندوق کلید شخصی (AES-256-GCM)'
+            : 'هسته سازمانی آرکا'
         }`
       );
     } catch (err: any) {
-      const msg =
-        err?.message || 'خطا در تست و اعتبارسنجی اتصال هوش مصنوعی آرکا.';
-      setErrorMsg(msg);
-      onEmitTelemetryLog?.('error', 'AI-Router', msg);
+      if (err instanceof ArkaAiRequestError) {
+        setClassifiedError(err.classified);
+        setErrorMsg(err.classified.messageFa);
+        onEmitTelemetryLog?.('error', 'AI-Router', err.classified.messageFa);
+      } else {
+        const msg =
+          err?.message || 'خطا در تست و اعتبارسنجی اتصال هوش مصنوعی آرکا.';
+        setErrorMsg(msg);
+        onEmitTelemetryLog?.('error', 'AI-Router', msg);
+      }
     } finally {
       setIsVerifyingConnection(false);
     }
@@ -533,11 +592,11 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     setTimeout(() => setCopiedKey(null), 1800);
   };
 
-  const handleGenerate = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const executeGenerationRequest = async (allowModelFallback = false) => {
     if (isGenerating) return;
     setIsGenerating(true);
     setErrorMsg(null);
+    setClassifiedError(null);
 
     const activeSource: ArkaConnectionSource = isByokActive
       ? 'custom-byok'
@@ -552,47 +611,30 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     onEmitTelemetryLog?.(
       'ok',
       'AI-Router',
-      `ارسال درخواست (${liveModelDecision.detectedSlashCommand || mode}) ← پیش‌بینی مدل: ${liveModelDecision.modelId} · منبع: ${creditSourceDisplay.short}`
+      `ارسال درخواست (${
+        liveModelDecision.detectedSlashCommand || mode
+      }) ← مدل هدف: ${
+        allowModelFallback
+          ? `${liveModelDecision.fallbackModelId} (تلاش مجدد با جایگزین)`
+          : liveModelDecision.modelId
+      } · منبع: ${creditSourceDisplay.short}`
     );
 
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      };
-      if (!isByokActive) {
-        const idToken = await getFirebaseIdToken();
-        if (!idToken) {
-          const authMsg = 'برای استفاده وارد شوید یا کلید شخصی ثبت کنید';
-          setErrorMsg(authMsg);
-          onEmitTelemetryLog?.('warn', 'Auth', authMsg);
-          return;
-        }
-        headers.Authorization = `Bearer ${idToken}`;
-      }
-
-      const response = await fetch('/api/arka-ai/generate', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          mode,
-          productName: `${selectedProduct.name} (${selectedProduct.group})`,
-          targetAudience,
-          campaignGoal,
-          tone,
-          customPrompt,
-          jsonMode: isJsonActive,
-          customApiKey: isByokActive ? customApiKey : '',
-          connectionMode: activeSource,
-        }),
+      const data = await generateArkaStudioContent({
+        mode,
+        productName: `${selectedProduct.name} (${selectedProduct.group})`,
+        targetAudience,
+        campaignGoal,
+        tone,
+        customPrompt,
+        jsonMode: isJsonActive,
+        connectionMode: activeSource,
+        brandProfile,
+        articleKeywords,
+        articleSearchIntent,
+        allowModelFallback,
       });
-
-      const data = await response.json();
-      if (!response.ok || !data?.ok) {
-        throw new Error(
-          data?.error ||
-            'خطا در تولید محتوای هوشمند. لطفاً کلید یا اتصال سرویس را بررسی کنید.'
-        );
-      }
 
       setAiResult(data.result);
       if (data.executionMeta) {
@@ -604,16 +646,16 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
             data.executionMeta.selectedModel
           }${
             data.executionMeta.usedFallback
-              ? ` [فالبک از ${data.executionMeta.plannedModel}]`
+              ? ` [جایگزین با تایید کاربر از ${data.executionMeta.plannedModel}]`
               : ''
           }`
         );
       }
       setSavedDriveSheetInfo(null);
 
-      // Automatically save to the signed-in Gmail user's cloud history
       if (currentUser && data.result) {
         const title =
+          data.result.articleTitleH1 ||
           data.result.calendarTitle ||
           data.result.scenarioTitle ||
           data.result.deckTitle ||
@@ -629,18 +671,33 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
           contentObj: data.result,
         });
         if (savedItem) {
-          setSavedHistory((prev) => [savedItem, ...prev.slice(0, 14)]);
+          setSavedHistory((prev) => [savedItem, ...prev.slice(0, 19)]);
         }
       }
     } catch (err: any) {
-      const msg =
-        err?.message ||
-        'خطا در ارتباط با موتور هوش مصنوعی آرکا. دوباره تلاش کنید.';
-      setErrorMsg(msg);
-      onEmitTelemetryLog?.('error', 'AI-Router', msg);
+      if (err instanceof ArkaAiRequestError) {
+        setClassifiedError(err.classified);
+        setErrorMsg(err.classified.messageFa);
+        onEmitTelemetryLog?.(
+          'error',
+          'AI-Router',
+          `[${err.classified.errorCode}] ${err.classified.messageFa}`
+        );
+      } else {
+        const msg =
+          err?.message ||
+          'خطا در ارتباط با موتور هوش مصنوعی آرکا. دوباره تلاش کنید.';
+        setErrorMsg(msg);
+        onEmitTelemetryLog?.('error', 'AI-Router', msg);
+      }
     } finally {
       setIsGenerating(false);
     }
+  };
+
+  const handleGenerate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await executeGenerationRequest(false);
   };
 
   const handleDeleteSavedItem = async (id: string) => {
@@ -761,7 +818,8 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
         headerMeta: 'تولیدشده با هسته ۶ ماژوله آرکا · arka-acc.ir',
         eyebrow: slide.badge_text || selectedProduct.eyebrow,
         headlinePart1: parts.slice(0, mid).join(' '),
-        headlineHighlight: parts.slice(mid, mid + 2).join(' ') || selectedProduct.name,
+        headlineHighlight:
+          parts.slice(mid, mid + 2).join(' ') || selectedProduct.name,
         headlinePart2: parts.slice(mid + 2).join(' '),
         leadCopy: slide.subheadline || '',
         primaryStatValue: '۱۰۰ سند دمو',
@@ -911,7 +969,41 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     }
   };
 
-  // Helper extraction for Rich Visualizers
+  const buildFullArticleMarkdown = (art: GeneratedSeoArticleResult): string => {
+    const sectionsText = (art.sections || [])
+      .map(
+        (s) =>
+          `${s.headingLevel === 'H3' ? '###' : '##'} ${s.headingTitle}\n\n${(
+            s.bodyParagraphs || []
+          ).join('\n\n')}${
+            s.keyTakeaway ? `\n\n> **نکته کلیدی آرکا:** ${s.keyTakeaway}` : ''
+          }`
+      )
+      .join('\n\n');
+
+    const faqText = (art.faqItems || [])
+      .map((f, i) => `**${i + 1}. ${f.question}**\n${f.answer}`)
+      .join('\n\n');
+
+    return `# ${art.articleTitleH1}\n\n**Meta Title:** ${art.metaTitle}\n**Meta Description:** ${art.metaDescription}\n**Slug:** /blog/${art.suggestedSlug}\n\n---\n\n### پاسخ مستقیم (AEO Answer Box)\n${art.aeoDirectAnswerBox}\n\n### خلاصه استنادی هوش مصنوعی (GEO Citation)\n${art.geoCitationSummary}\n\n---\n\n${sectionsText}\n\n---\n\n## سوالات متداول (FAQ)\n\n${faqText}`;
+  };
+
+  const buildFaqJsonLdSchema = (art: GeneratedSeoArticleResult): string => {
+    const schema = {
+      '@context': 'https://schema.org',
+      '@type': 'FAQPage',
+      mainEntity: (art.faqItems || []).map((f) => ({
+        '@type': 'Question',
+        name: f.question,
+        acceptedAnswer: {
+          '@type': 'Answer',
+          text: f.answer,
+        },
+      })),
+    };
+    return JSON.stringify(schema, null, 2);
+  };
+
   const enterpriseSlides: CanvasSlideSchemaItem[] = Array.isArray(
     aiResult?.canvas_slides
   )
@@ -932,37 +1024,56 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
   return (
     <aside className="w-full lg:w-[460px] shrink-0 bg-white border border-[#e3e9ed] rounded-[20px] shadow-sm flex flex-col overflow-hidden text-[#233b53]">
       {/* Top Header in Arka Navy / Enterprise Dark */}
-      <div className="px-5 py-4 bg-[#062959] text-white flex flex-col gap-3">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
+      <div className="px-4 sm:px-5 py-4 bg-[#062959] text-white flex flex-col gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
             <div className="w-8 h-8 rounded-xl bg-[#08cdbd] text-[#062959] flex items-center justify-center shrink-0">
               <Sparkles className="w-4 h-4" />
             </div>
-            <div>
-              <h2 className="text-sm font-black text-white">
+            <div className="min-w-0">
+              <h2 className="text-sm font-black text-white truncate">
                 هسته مرکزی هوش مصنوعی آرکــا
               </h2>
-              <p className="text-[11px] text-[#a4d2d1]">
-                Smart Router (2.5 Pro/Flash) · StoryCanvas · Workspace
+              <p className="text-[11px] text-[#a4d2d1] truncate">
+                Capability Router · SEO/AEO/GEO · BYOK Vault
               </p>
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={handleRefreshSiteData}
-            disabled={isSyncingSite}
-            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#0b2b56] hover:bg-[#08cdbd] hover:text-[#062959] text-[11px] font-bold text-[#14dac3] border border-[#14dac3]/30 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-            title="Force Refresh: واکشی مجدد اطلاعات زنده سایت arka-acc.ir"
-          >
-            <RefreshCw
-              className={`w-3.5 h-3.5 ${isSyncingSite ? 'animate-spin' : ''}`}
-            />
-            <span>Force Refresh</span>
-          </button>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                setShowBrandHub((v) => !v);
+                setShowHistory(false);
+              }}
+              className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-bold border transition-colors cursor-pointer whitespace-nowrap ${
+                showBrandHub
+                  ? 'bg-[#08cdbd] text-[#062959] border-[#08cdbd]'
+                  : 'bg-[#0b2b56] text-[#14dac3] border-[#14dac3]/35 hover:bg-[#08cdbd] hover:text-[#062959]'
+              }`}
+              title="قطب هوش برند آرکا (Brand Intelligence Hub)"
+            >
+              <BrainCircuit className="w-3.5 h-3.5" />
+              <span>هوش برند</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleRefreshSiteData}
+              disabled={isSyncingSite}
+              className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg bg-[#0b2b56] hover:bg-[#08cdbd] hover:text-[#062959] text-[11px] font-bold text-[#14dac3] border border-[#14dac3]/30 transition-colors cursor-pointer whitespace-nowrap"
+              title="Force Refresh: واکشی مجدد اطلاعات زنده سایت arka-acc.ir"
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${isSyncingSite ? 'animate-spin' : ''}`}
+              />
+              <span className="hidden sm:inline">Sync</span>
+            </button>
+          </div>
         </div>
 
-        {/* Google Account + BYOK API Key Quick Status Strip */}
+        {/* Google Account + Encrypted BYOK Vault Quick Status Strip */}
         <div className="p-2.5 rounded-xl bg-[#0b2b56] border border-white/12 flex items-center justify-between gap-2">
           {currentUser ? (
             <div className="flex items-center justify-between w-full gap-2">
@@ -995,7 +1106,10 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
               <div className="flex items-center gap-1.5 shrink-0">
                 <button
                   type="button"
-                  onClick={() => setShowHistory((v) => !v)}
+                  onClick={() => {
+                    setShowHistory((v) => !v);
+                    setShowBrandHub(false);
+                  }}
                   className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
                     showHistory
                       ? 'bg-[#08cdbd] text-[#062959]'
@@ -1012,10 +1126,10 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                     type="button"
                     onClick={onOpenAuthKeyModal}
                     className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg bg-purple-500/20 hover:bg-purple-500/35 text-purple-200 border border-purple-400/30 text-[11px] font-bold cursor-pointer"
-                    title="مدیریت اعتبار، کلید API شخصی و حساب گوگل"
+                    title="گاوصندوق امن کلید API شخصی (AES-256-GCM) و حساب گوگل"
                   >
                     <KeyRound className="w-3.5 h-3.5" />
-                    <span>API Key</span>
+                    <span>{hasVerifiedByok ? 'Vault ✓' : 'API Key'}</span>
                   </button>
                 )}
                 <button
@@ -1038,9 +1152,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                     className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-purple-500/20 hover:bg-purple-500/30 text-purple-200 border border-purple-400/40 text-[11px] font-bold cursor-pointer"
                   >
                     <KeyRound className="w-3.5 h-3.5" />
-                    <span>
-                      {hasVerifiedByok ? 'کلید شخصی فعال ✓' : 'تنظیم API Key'}
-                    </span>
+                    <span>تنظیم گاوصندوق API Key</span>
                   </button>
                 )}
               </div>
@@ -1069,7 +1181,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                   />
                 </svg>
                 <span>
-                  {isSigningIn ? 'در حال اتصال...' : 'ورود با جیمیل (Drive/Sheets)'}
+                  {isSigningIn ? 'در حال اتصال...' : 'ورود با جیمیل'}
                 </span>
               </button>
             </div>
@@ -1077,23 +1189,43 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
         </div>
       </div>
 
-      {/* 5 AI Mode Selector Tabs */}
+      {/* 6 AI Mode Selector Tabs (Including SEO / AEO / GEO Article Studio) */}
       <div className="p-2 bg-[#f5f8fa] border-b border-[#e3e9ed] flex flex-col gap-1.5">
-        <button
-          type="button"
-          onClick={() => {
-            setMode('campaign-calendar-30');
-            setShowHistory(false);
-          }}
-          className={`w-full flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-black transition-colors cursor-pointer min-h-[42px] border ${
-            mode === 'campaign-calendar-30' && !showHistory
-              ? 'bg-[#062959] text-[#14dac3] border-[#08cdbd] shadow-xs'
-              : 'bg-white text-[#062959] border-[#08cdbd]/50 hover:bg-[#e5fbf9]'
-          }`}
-        >
-          <CalendarDays className="w-4 h-4 shrink-0 text-[#08cdbd]" />
-          <span>تقویم کمپین ۳۰ روزه آرکا + ذخیره در Google Drive</span>
-        </button>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+          <button
+            type="button"
+            onClick={() => {
+              setMode('campaign-calendar-30');
+              setShowHistory(false);
+              setShowBrandHub(false);
+            }}
+            className={`flex items-center justify-center gap-1.5 py-2.5 px-2.5 rounded-xl text-xs font-black transition-colors cursor-pointer min-h-[40px] border ${
+              mode === 'campaign-calendar-30' && !showHistory && !showBrandHub
+                ? 'bg-[#062959] text-[#14dac3] border-[#08cdbd] shadow-xs'
+                : 'bg-white text-[#062959] border-[#08cdbd]/40 hover:bg-[#e5fbf9]'
+            }`}
+          >
+            <CalendarDays className="w-4 h-4 shrink-0 text-[#08cdbd]" />
+            <span>تقویم ۳۰ روزه + Drive</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setMode('seo-article');
+              setShowHistory(false);
+              setShowBrandHub(false);
+            }}
+            className={`flex items-center justify-center gap-1.5 py-2.5 px-2.5 rounded-xl text-xs font-black transition-colors cursor-pointer min-h-[40px] border ${
+              mode === 'seo-article' && !showHistory && !showBrandHub
+                ? 'bg-[#062959] text-[#14dac3] border-[#08cdbd] shadow-xs'
+                : 'bg-white text-[#062959] border-[#08cdbd]/40 hover:bg-[#e5fbf9]'
+            }`}
+          >
+            <FileText className="w-4 h-4 shrink-0 text-[#08cdbd]" />
+            <span>استودیو مقاله SEO/AEO/GEO</span>
+          </button>
+        </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-1">
           <button
@@ -1101,9 +1233,10 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
             onClick={() => {
               setMode('reels-script');
               setShowHistory(false);
+              setShowBrandHub(false);
             }}
             className={`flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[38px] ${
-              mode === 'reels-script' && !showHistory
+              mode === 'reels-script' && !showHistory && !showBrandHub
                 ? 'bg-[#062959] text-white shadow-xs'
                 : 'text-[#233b53] hover:bg-white'
             }`}
@@ -1117,9 +1250,10 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
             onClick={() => {
               setMode('canvas-slide');
               setShowHistory(false);
+              setShowBrandHub(false);
             }}
             className={`flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[38px] ${
-              mode === 'canvas-slide' && !showHistory
+              mode === 'canvas-slide' && !showHistory && !showBrandHub
                 ? 'bg-[#062959] text-white shadow-xs'
                 : 'text-[#233b53] hover:bg-white'
             }`}
@@ -1133,9 +1267,10 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
             onClick={() => {
               setMode('carousel-deck');
               setShowHistory(false);
+              setShowBrandHub(false);
             }}
             className={`flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[38px] ${
-              mode === 'carousel-deck' && !showHistory
+              mode === 'carousel-deck' && !showHistory && !showBrandHub
                 ? 'bg-[#062959] text-white shadow-xs'
                 : 'text-[#233b53] hover:bg-white'
             }`}
@@ -1149,9 +1284,10 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
             onClick={() => {
               setMode('campaign-plan');
               setShowHistory(false);
+              setShowBrandHub(false);
             }}
             className={`flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl text-xs font-bold transition-colors cursor-pointer whitespace-nowrap min-h-[38px] ${
-              mode === 'campaign-plan' && !showHistory
+              mode === 'campaign-plan' && !showHistory && !showBrandHub
                 ? 'bg-[#062959] text-white shadow-xs'
                 : 'text-[#233b53] hover:bg-white'
             }`}
@@ -1163,8 +1299,159 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
       </div>
 
       {/* Main Scrollable Content Area */}
-      <div className="p-5 space-y-4 overflow-y-auto max-h-[760px]">
-        {showHistory ? (
+      <div className="p-4 sm:p-5 space-y-4 overflow-y-auto max-h-[780px]">
+        {showBrandHub ? (
+          /* ==================== BRAND INTELLIGENCE HUB ==================== */
+          <form onSubmit={handleSaveBrandHubProfile} className="space-y-3.5">
+            <div className="flex items-center justify-between gap-2 pb-2 border-b border-[#e3e9ed]">
+              <div className="flex items-center gap-2">
+                <BrainCircuit className="w-4 h-4 text-[#089f93]" />
+                <h3 className="text-xs font-black text-[#062959]">
+                  قطب هوش برند آرکا (Brand Intelligence Hub)
+                </h3>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleResetBrandHubToDefault}
+                  className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-500 hover:text-amber-400 cursor-pointer"
+                  title="بازگردانی به اطلاعات استاندارد سایت arka-acc.ir"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  <span>پیش‌فرض آرکا</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowBrandHub(false)}
+                  className="text-xs font-bold text-[#089f93] cursor-pointer"
+                >
+                  بازگشت
+                </button>
+              </div>
+            </div>
+
+            <p className="text-[11px] text-[#7e8c9b] leading-relaxed">
+              اطلاعات این بخش به‌صورت خودکار در تمام ماژول‌های تولید محتوا (مقاله SEO/AEO/GEO، تقویم کمپین، اسلاید بوم، کاروسل و ریلز) تزریق می‌شود تا خروجی‌ها کاملاً هم‌راستا با هویت برند شما باشند.
+            </p>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div>
+                <label className="block text-[11px] font-bold text-[#062959] mb-1">
+                  نام برند / سازمان
+                </label>
+                <input
+                  type="text"
+                  value={brandProfile.brandName}
+                  onChange={(e) =>
+                    setBrandProfile((p) => ({ ...p, brandName: e.target.value }))
+                  }
+                  className="w-full bg-[#f5f8fa] border border-[#e3e9ed] rounded-xl px-3 py-2 text-xs text-[#062959] outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-bold text-[#062959] mb-1">
+                  شعار و جایگاه برند (Tagline)
+                </label>
+                <input
+                  type="text"
+                  value={brandProfile.tagline}
+                  onChange={(e) =>
+                    setBrandProfile((p) => ({ ...p, tagline: e.target.value }))
+                  }
+                  className="w-full bg-[#f5f8fa] border border-[#e3e9ed] rounded-xl px-3 py-2 text-xs text-[#062959] outline-none"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-bold text-[#062959] mb-1">
+                ارزش پیشنهادی و محصولات کلیدی (Core Value Proposition)
+              </label>
+              <textarea
+                rows={2}
+                value={brandProfile.coreValueProposition}
+                onChange={(e) =>
+                  setBrandProfile((p) => ({
+                    ...p,
+                    coreValueProposition: e.target.value,
+                  }))
+                }
+                className="w-full bg-[#f5f8fa] border border-[#e3e9ed] rounded-xl px-3 py-2 text-xs text-[#062959] outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-bold text-[#062959] mb-1">
+                بخش‌بندی مخاطبان هدف (Target Audiences)
+              </label>
+              <textarea
+                rows={2}
+                value={brandProfile.targetAudienceSegments}
+                onChange={(e) =>
+                  setBrandProfile((p) => ({
+                    ...p,
+                    targetAudienceSegments: e.target.value,
+                  }))
+                }
+                className="w-full bg-[#f5f8fa] border border-[#e3e9ed] rounded-xl px-3 py-2 text-xs text-[#062959] outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-bold text-[#062959] mb-1">
+                مزیت رقابتی و تمایز بازار (Competitive Positioning)
+              </label>
+              <textarea
+                rows={2}
+                value={brandProfile.competitivePositioning}
+                onChange={(e) =>
+                  setBrandProfile((p) => ({
+                    ...p,
+                    competitivePositioning: e.target.value,
+                  }))
+                }
+                className="w-full bg-[#f5f8fa] border border-[#e3e9ed] rounded-xl px-3 py-2 text-xs text-[#062959] outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-bold text-[#062959] mb-1">
+                کلمات کلیدی کانونی سئو و صفحات لینک‌سازی داخلی (SEO Pillars)
+              </label>
+              <textarea
+                rows={2}
+                value={brandProfile.focusKeywords}
+                onChange={(e) =>
+                  setBrandProfile((p) => ({
+                    ...p,
+                    focusKeywords: e.target.value,
+                  }))
+                }
+                className="w-full bg-[#f5f8fa] border border-[#e3e9ed] rounded-xl px-3 py-2 text-xs text-[#062959] outline-none"
+              />
+            </div>
+
+            {brandSavedBanner && (
+              <div className="p-2.5 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-400 text-xs font-bold flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <span>{brandSavedBanner}</span>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={isSavingBrandProfile}
+              className="w-full py-2.5 px-4 rounded-xl bg-[#08cdbd] hover:bg-[#14dac3] text-[#062959] font-black text-xs flex items-center justify-center gap-2 cursor-pointer"
+            >
+              {isSavingBrandProfile ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <CheckCircle2 className="w-4 h-4" />
+              )}
+              <span>ذخیره و همگام‌سازی قطب هوش برند در کل استودیو</span>
+            </button>
+          </form>
+        ) : showHistory ? (
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="text-xs font-black text-[#062959]">
@@ -1182,10 +1469,10 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
             {savedHistory.length === 0 ? (
               <div className="p-6 rounded-2xl bg-[#f5f8fa] border border-[#e3e9ed] text-center space-y-2">
                 <p className="text-xs font-bold text-[#062959]">
-                  هنوز سناریو یا کمپینی در حساب جیمیل شما ذخیره نشده است.
+                  هنوز سناریو، مقاله یا کمپینی در حساب جیمیل شما ذخیره نشده است.
                 </p>
                 <p className="text-[11px] text-[#7e8c9b]">
-                  با تولید هر سناریو، کپشن یا اسلاید، نسخه‌ای از آن به‌صورت خودکار در فضای ابری اکانت شما ذخیره می‌شود.
+                  با تولید هر مقاله، سناریو یا اسلاید، نسخه‌ای از آن به‌صورت خودکار در فضای ابری اکانت شما ذخیره می‌شود.
                 </p>
               </div>
             ) : (
@@ -1235,7 +1522,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
           </div>
         ) : (
           <>
-            {/* Quick Google Workspace Sync Strip (when authenticated) */}
+            {/* Quick Google Workspace Sync Strip */}
             {currentUser && !needsAuth ? (
               <div className="p-2.5 rounded-xl bg-[#e5fbf9] border border-[#08cdbd]/50 flex flex-wrap items-center justify-between gap-2 text-[11px]">
                 <span className="font-bold text-[#062959] flex items-center gap-1.5">
@@ -1260,7 +1547,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                 <span className="font-bold text-amber-200 flex items-center gap-1.5">
                   <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                   <span>
-                    ورود گوگل فعال است (هوش مصنوعی آماده) · برای Drive/Sheets دسترسی را تمدید کنید
+                    ورود گوگل فعال است · برای Drive/Sheets دسترسی را تمدید کنید
                   </span>
                 </span>
                 <button
@@ -1269,7 +1556,9 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                   onClick={onGoogleSignIn}
                   className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-400 hover:bg-amber-300 text-[#062959] font-black cursor-pointer shrink-0"
                 >
-                  <span>{isSigningIn ? 'در حال اتصال...' : 'اتصال Drive/Sheets'}</span>
+                  <span>
+                    {isSigningIn ? 'در حال اتصال...' : 'اتصال Drive/Sheets'}
+                  </span>
                 </button>
               </div>
             ) : null}
@@ -1318,6 +1607,63 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                   />
                 </div>
               </div>
+
+              {/* Dedicated SEO / AEO / GEO Article Inputs when mode === 'seo-article' */}
+              {mode === 'seo-article' && (
+                <div className="p-3 rounded-xl bg-[#07090E] border border-[#08cdbd]/40 space-y-2.5 text-xs">
+                  <div className="flex items-center justify-between text-[#14dac3] font-black">
+                    <span className="flex items-center gap-1.5">
+                      <FileText className="w-3.5 h-3.5" />
+                      <span>تنظیمات تخصصی مقاله SEO / AEO / GEO</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      Schema + Citations
+                    </span>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                      کلمه کلیدی اصلی و عبارات هم‌خانواده (Keywords):
+                    </label>
+                    <input
+                      type="text"
+                      value={articleKeywords}
+                      onChange={(e) => setArticleKeywords(e.target.value)}
+                      placeholder="مثلاً: نرم افزار حسابداری فروشگاهی، اتصال سامانه مودیان..."
+                      className="w-full bg-[#0F1420] border border-slate-700 focus:border-[#08cdbd] rounded-lg px-3 py-2 text-xs text-white outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                      نیت جستجوی مخاطب (Search Intent):
+                    </label>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                      {(
+                        [
+                          { id: 'Commercial', label: 'تجاری و مقایسه‌ای' },
+                          { id: 'Informational', label: 'آموزشی و راهنما' },
+                          { id: 'Transactional', label: 'خرید و دانلود دمو' },
+                          { id: 'Navigational', label: 'برندینگ آرکا' },
+                        ] as const
+                      ).map((intent) => (
+                        <button
+                          key={intent.id}
+                          type="button"
+                          onClick={() => setArticleSearchIntent(intent.id)}
+                          className={`px-2 py-1.5 rounded-lg text-[10px] font-bold border cursor-pointer transition-colors ${
+                            articleSearchIntent === intent.id
+                              ? 'bg-[#08cdbd] text-[#062959] border-[#08cdbd] font-black'
+                              : 'bg-[#0F1420] text-slate-300 border-slate-700 hover:border-slate-500'
+                          }`}
+                        >
+                          {intent.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <div>
                 <label className="block text-xs font-bold text-[#062959] mb-1">
@@ -1422,7 +1768,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                 />
               </div>
 
-              {/* ==================== PRE-FLIGHT TELEMETRY HUD BAR (RIGHT ABOVE GENERATE) ==================== */}
+              {/* ==================== PRE-FLIGHT TELEMETRY HUD BAR ==================== */}
               <div className="p-3 rounded-xl bg-[#07090E] border border-[#1e293b] space-y-2 text-[11px] text-slate-200 arka-neon-purple-ring">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 font-black text-[#14dac3]">
@@ -1436,7 +1782,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                         onClick={onOpenAuthKeyModal}
                         className="px-2 py-0.5 rounded-md bg-white/10 hover:bg-white/20 text-[10px] font-bold text-slate-200 cursor-pointer"
                       >
-                        تغییر منبع / کلید
+                        گاوصندوق کلید
                       </button>
                     )}
                     <button
@@ -1476,12 +1822,12 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                   {liveModelDecision.reasoningFa}
                 </div>
 
-                {/* Line 3: Live Site 8-System Catalog Cache Status */}
+                {/* Line 3: Live Site 8-System Catalog + Brand Hub Status */}
                 <div className="pt-1.5 border-t border-slate-800 flex flex-wrap items-center justify-between gap-1.5 text-[10px]">
                   <span className="text-cyan-300 font-bold flex items-center gap-1">
                     <Zap className="w-3 h-3 text-cyan-400 shrink-0" />
                     <span>
-                      کاتالوگ ۸ سیستم آرکا: متصل (
+                      کاتالوگ ۸ سیستم + هوش برند: فعال (
                       {siteSyncStatus?.cached
                         ? 'Cached · 6h'
                         : siteSyncStatus?.fetchedLive
@@ -1500,7 +1846,6 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                   )}
                 </div>
 
-                {/* Optional quick switcher inside HUD when user has verified BYOK or Gmail */}
                 {(hasVerifiedByok || Boolean(currentUser)) && (
                   <div className="pt-1.5 border-t border-slate-800 flex flex-wrap items-center gap-1">
                     {currentUser && (
@@ -1528,7 +1873,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                             : 'bg-slate-900 text-slate-400 border-slate-800'
                         }`}
                       >
-                        🔵 کلید API شخصی
+                        🔵 گاوصندوق کلید شخصی
                       </button>
                     )}
                     <button
@@ -1568,6 +1913,8 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                       <span>
                         {activeSlashCommand
                           ? `اجرای دستور ${activeSlashCommand} + تولید اسلاید بوم`
+                          : mode === 'seo-article'
+                          ? 'تولید مقاله جامع SEO / AEO / GEO + اسکیمای FAQ'
                           : mode === 'campaign-calendar-30'
                           ? 'تولید تقویم ۳۰ روزه چرخه محصولات آرکا'
                           : mode === 'reels-script'
@@ -1610,7 +1957,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                   </strong>
                   {lastExecutionMeta.usedFallback && (
                     <span className="mr-1 text-amber-500 font-bold">
-                      (فالبک خودکار)
+                      (مدل جایگزین با تایید کاربر)
                     </span>
                   )}
                 </span>
@@ -1618,8 +1965,9 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                   {lastExecutionMeta.latencyMs
                     ? `${lastExecutionMeta.latencyMs}ms · `
                     : ''}
-                  {lastExecutionMeta.keySource === 'custom-byok'
-                    ? 'کلید شخصی شما'
+                  {lastExecutionMeta.keySource === 'vault-byok' ||
+                  lastExecutionMeta.keySource === 'custom-byok'
+                    ? 'گاوصندوق کلید شخصی شما'
                     : lastExecutionMeta.connectionMode === 'gmail-authenticated'
                     ? 'اکانت جیمیل کاربر'
                     : 'هسته سازمانی آرکا'}
@@ -1627,16 +1975,409 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
               </div>
             )}
 
+            {/* ==================== STRUCTURED ERROR & EXPLICIT FALLBACK RETRY CARD ==================== */}
             {errorMsg && (
-              <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/40 text-rose-400 text-xs flex items-start gap-2">
-                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-                <span>{errorMsg}</span>
+              <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/40 text-rose-300 text-xs space-y-2.5">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                    <span className="leading-relaxed">{errorMsg}</span>
+                  </div>
+                  {classifiedError?.errorCode && (
+                    <span
+                      dir="ltr"
+                      className="px-2 py-0.5 rounded bg-rose-500/20 border border-rose-500/40 text-[10px] font-mono font-black text-rose-200 shrink-0"
+                    >
+                      {classifiedError.errorCode}
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  {classifiedError?.canFallbackToFlash && (
+                    <button
+                      type="button"
+                      disabled={isGenerating}
+                      onClick={() => executeGenerationRequest(true)}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#08cdbd] hover:bg-[#14dac3] text-[#062959] text-xs font-black cursor-pointer shadow-sm"
+                    >
+                      <Zap className="w-3.5 h-3.5" />
+                      <span>
+                        تلاش مجدد با مدل جایگزین (Gemini 2.5 Flash)
+                      </span>
+                    </button>
+                  )}
+
+                  {(classifiedError?.errorCode === 'BYOK_KEY_REQUIRED' ||
+                    classifiedError?.errorCode === 'INVALID_API_KEY' ||
+                    classifiedError?.errorCode === 'AUTH_REQUIRED') &&
+                    onOpenAuthKeyModal && (
+                      <button
+                        type="button"
+                        onClick={onOpenAuthKeyModal}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-black cursor-pointer"
+                      >
+                        <KeyRound className="w-3.5 h-3.5" />
+                        <span>ثبت / مدیریت کلید در گاوصندوق امن سرور</span>
+                      </button>
+                    )}
+                </div>
               </div>
             )}
 
             {/* ==================== AI OUTPUT DISPLAY & RICH VISUALIZERS ==================== */}
             {aiResult && (
               <div className="pt-4 border-t border-[#e3e9ed] space-y-4">
+                {/* 0. SEO / AEO / GEO ARTICLE STUDIO OUTPUT VISUALIZER */}
+                {mode === 'seo-article' && aiResult.articleTitleH1 && (
+                  <div className="space-y-3.5">
+                    <div className="p-4 rounded-2xl bg-[#062959] text-white space-y-2.5 border border-[#08cdbd]/40">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="px-2 py-0.5 rounded-md bg-[#08cdbd]/20 text-[#14dac3] text-[10px] font-black">
+                          مقاله SEO / AEO / GEO · نیت جستجو:{' '}
+                          {aiResult.searchIntent}
+                        </span>
+                        <span className="text-[11px] text-slate-300 tabular-nums-fa">
+                          زمان مطالعه: {aiResult.estimatedReadingMinutes || 6}{' '}
+                          دقیقه
+                        </span>
+                      </div>
+
+                      <h3 className="text-sm sm:text-base font-black text-white leading-snug">
+                        {aiResult.articleTitleH1}
+                      </h3>
+
+                      <div className="p-2.5 rounded-xl bg-[#0b2b56] border border-white/10 space-y-1 text-[11px]">
+                        <div>
+                          <strong className="text-[#14dac3]">Meta Title: </strong>
+                          <span className="text-white">{aiResult.metaTitle}</span>
+                        </div>
+                        <div>
+                          <strong className="text-[#14dac3]">
+                            Meta Description:{' '}
+                          </strong>
+                          <span className="text-slate-200">
+                            {aiResult.metaDescription}
+                          </span>
+                        </div>
+                        <div dir="ltr" className="text-left font-mono text-[10px] text-cyan-300">
+                          https://arka-acc.ir/blog/{aiResult.suggestedSlug}
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopy(
+                              buildFullArticleMarkdown(aiResult),
+                              'seo-full-md'
+                            )
+                          }
+                          className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl bg-[#08cdbd] hover:bg-[#14dac3] text-[#062959] text-xs font-black cursor-pointer"
+                        >
+                          {copiedKey === 'seo-full-md' ? (
+                            <Check className="w-3.5 h-3.5" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                          <span>
+                            {copiedKey === 'seo-full-md'
+                              ? 'کل مقاله کپی شد!'
+                              : 'کپی متن کامل مقاله (Markdown)'}
+                          </span>
+                        </button>
+
+                        {aiResult.heroSlide && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onInjectSlideIntoCanvas(
+                                aiResult.heroSlide,
+                                aiResult.instagramCaptionSnippet
+                              )
+                            }
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-[11px] font-bold cursor-pointer"
+                          >
+                            <ArrowUpRight className="w-3.5 h-3.5 text-[#14dac3]" />
+                            <span>اعمال کاور مقاله روی بوم</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Keywords & Search Intent Analysis */}
+                    <div className="p-3 rounded-xl bg-[#f5f8fa] border border-[#e3e9ed] space-y-2 text-xs">
+                      <div className="font-black text-[#062959]">
+                        تحلیل کلمات کلیدی و نیت جستجو (Search Intent):
+                      </div>
+                      <p className="text-[11px] text-[#233b53] leading-relaxed">
+                        {aiResult.searchIntentAnalysisFa}
+                      </p>
+                      <div className="flex flex-wrap gap-1">
+                        <span className="px-2 py-0.5 rounded-md bg-[#062959] text-[#14dac3] text-[10px] font-black">
+                          اصلی: {aiResult.primaryKeyword}
+                        </span>
+                        {Array.isArray(aiResult.secondaryKeywords) &&
+                          aiResult.secondaryKeywords.map(
+                            (kw: string, kIdx: number) => (
+                              <span
+                                key={kIdx}
+                                className="px-2 py-0.5 rounded-md bg-white border border-[#e3e9ed] text-[#233b53] text-[10px] font-bold"
+                              >
+                                {kw}
+                              </span>
+                            )
+                          )}
+                      </div>
+                    </div>
+
+                    {/* AEO Direct Answer Box & GEO Citation Box */}
+                    <div className="grid grid-cols-1 gap-2.5">
+                      <div className="p-3.5 rounded-xl bg-[#e5fbf9] border border-[#08cdbd] space-y-1.5 text-xs">
+                        <div className="flex items-center justify-between font-black text-[#062959]">
+                          <span>
+                            باکس پاسخ مستقیم گوگل (AEO Featured Snippet)
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleCopy(
+                                aiResult.aeoDirectAnswerBox,
+                                'aeo-box-copy'
+                              )
+                            }
+                            className="text-[10px] font-bold text-[#089f93] cursor-pointer"
+                          >
+                            {copiedKey === 'aeo-box-copy' ? 'کپی شد' : 'کپی'}
+                          </button>
+                        </div>
+                        <p className="text-[#233b53] leading-relaxed">
+                          {aiResult.aeoDirectAnswerBox}
+                        </p>
+                      </div>
+
+                      <div className="p-3.5 rounded-xl bg-[#07090E] border border-purple-500/40 text-slate-200 space-y-1.5 text-xs">
+                        <div className="flex items-center justify-between font-black text-purple-300">
+                          <span>
+                            خلاصه استنادی موتورهای هوش مصنوعی (GEO Citation)
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleCopy(
+                                aiResult.geoCitationSummary,
+                                'geo-box-copy'
+                              )
+                            }
+                            className="text-[10px] font-bold text-[#14dac3] cursor-pointer"
+                          >
+                            {copiedKey === 'geo-box-copy' ? 'کپی شد' : 'کپی'}
+                          </button>
+                        </div>
+                        <p className="text-slate-300 leading-relaxed text-[11px]">
+                          {aiResult.geoCitationSummary}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Article Sections */}
+                    {Array.isArray(aiResult.sections) &&
+                      aiResult.sections.length > 0 && (
+                        <div className="space-y-2.5">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-black text-[#062959]">
+                              متن ساختاریافته مقاله ({aiResult.sections.length}{' '}
+                              بخش)
+                            </span>
+                            {onWriteStructuredToSheet && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onWriteStructuredToSheet({
+                                    title: `مقاله سئو آرکا - ${aiResult.articleTitleH1}`,
+                                    tabName: 'مقاله_SEO_AEO_GEO',
+                                    headers: [
+                                      'سطح تیتر',
+                                      'عنوان بخش',
+                                      'متن کامل بخش',
+                                      'نکته کلیدی آرکا',
+                                    ],
+                                    rows: aiResult.sections.map((s: any) => [
+                                      s.headingLevel || 'H2',
+                                      s.headingTitle || '',
+                                      (s.bodyParagraphs || []).join('\n\n'),
+                                      s.keyTakeaway || '',
+                                    ]),
+                                  })
+                                }
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 text-[11px] font-bold cursor-pointer"
+                              >
+                                <FileSpreadsheet className="w-3.5 h-3.5" />
+                                <span>ثبت در Google Sheets</span>
+                              </button>
+                            )}
+                          </div>
+
+                          {aiResult.sections.map((sec: any, idx: number) => (
+                            <div
+                              key={idx}
+                              className="p-3.5 rounded-xl bg-[#f5f8fa] border border-[#e3e9ed] space-y-2 text-xs"
+                            >
+                              <div className="flex items-center gap-2">
+                                <span className="px-1.5 py-0.5 rounded bg-[#062959] text-[#14dac3] font-mono text-[10px] font-black">
+                                  {sec.headingLevel || 'H2'}
+                                </span>
+                                <h4 className="font-black text-[#062959]">
+                                  {sec.headingTitle}
+                                </h4>
+                              </div>
+                              {Array.isArray(sec.bodyParagraphs) &&
+                                sec.bodyParagraphs.map(
+                                  (p: string, pIdx: number) => (
+                                    <p
+                                      key={pIdx}
+                                      className="text-[#233b53] leading-relaxed"
+                                    >
+                                      {p}
+                                    </p>
+                                  )
+                                )}
+                              {sec.keyTakeaway && (
+                                <div className="p-2 rounded-lg bg-white border border-[#08cdbd]/40 text-[11px] font-bold text-[#089f93]">
+                                  💡 مزیت عملیاتی آرکا: {sec.keyTakeaway}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                    {/* Internal Linking Recommendations */}
+                    {Array.isArray(aiResult.internalLinks) &&
+                      aiResult.internalLinks.length > 0 && (
+                        <div className="p-3.5 rounded-xl bg-[#f5f8fa] border border-[#e3e9ed] space-y-2 text-xs">
+                          <div className="font-black text-[#062959] flex items-center gap-1.5">
+                            <Link2 className="w-4 h-4 text-[#089f93]" />
+                            <span>
+                              پیشنهادهای لینک‌سازی داخلی (arka-acc.ir):
+                            </span>
+                          </div>
+                          <div className="space-y-1.5">
+                            {aiResult.internalLinks.map(
+                              (lnk: any, lIdx: number) => (
+                                <div
+                                  key={lIdx}
+                                  className="p-2 rounded-lg bg-white border border-[#e3e9ed] space-y-0.5"
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="font-black text-[#062959]">
+                                      انکرتکست: «{lnk.anchorText}»
+                                    </span>
+                                    <span
+                                      dir="ltr"
+                                      className="font-mono text-[10px] text-[#089f93]"
+                                    >
+                                      {lnk.targetUrl}
+                                    </span>
+                                  </div>
+                                  <div className="text-[11px] text-[#7e8c9b]">
+                                    {lnk.placementContext}
+                                  </div>
+                                </div>
+                              )
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                    {/* FAQ Schema + JSON-LD Copy */}
+                    {Array.isArray(aiResult.faqItems) &&
+                      aiResult.faqItems.length > 0 && (
+                        <div className="p-3.5 rounded-xl bg-[#f5f8fa] border border-[#e3e9ed] space-y-2 text-xs">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-black text-[#062959] flex items-center gap-1.5">
+                              <HelpCircle className="w-4 h-4 text-[#089f93]" />
+                              <span>
+                                سوالات متداول (FAQ Schema ·{' '}
+                                {aiResult.faqItems.length} مورد)
+                              </span>
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleCopy(
+                                  buildFaqJsonLdSchema(aiResult),
+                                  'faq-jsonld'
+                                )
+                              }
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#062959] text-[#14dac3] text-[10px] font-bold cursor-pointer"
+                            >
+                              <Braces className="w-3 h-3" />
+                              <span>
+                                {copiedKey === 'faq-jsonld'
+                                  ? 'اسکیما کپی شد!'
+                                  : 'کپی JSON-LD Schema'}
+                              </span>
+                            </button>
+                          </div>
+                          <div className="space-y-1.5">
+                            {aiResult.faqItems.map((fq: any, fIdx: number) => (
+                              <div
+                                key={fIdx}
+                                className="p-2.5 rounded-lg bg-white border border-[#e3e9ed] space-y-1"
+                              >
+                                <div className="font-black text-[#062959]">
+                                  ؟ {fq.question}
+                                </div>
+                                <div className="text-[#233b53] leading-relaxed">
+                                  {fq.answer}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                    {/* LinkedIn & Instagram Distribution Snippets */}
+                    {(aiResult.linkedinPostSnippet ||
+                      aiResult.instagramCaptionSnippet) && (
+                      <div className="p-3.5 rounded-xl bg-[#f5f8fa] border border-[#e3e9ed] space-y-2.5 text-xs">
+                        <div className="font-black text-[#062959] flex items-center gap-1.5">
+                          <Share2 className="w-4 h-4 text-[#089f93]" />
+                          <span>بسته توزیع مقاله در لینکدین و اینستاگرام:</span>
+                        </div>
+                        {aiResult.linkedinPostSnippet && (
+                          <div className="p-2.5 rounded-lg bg-white border border-[#e3e9ed] space-y-1">
+                            <div className="flex items-center justify-between">
+                              <span className="font-black text-[#062959]">
+                                پست تخصصی لینکدین:
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleCopy(
+                                    aiResult.linkedinPostSnippet,
+                                    'art-li-copy'
+                                  )
+                                }
+                                className="text-[10px] font-bold text-[#089f93] cursor-pointer"
+                              >
+                                {copiedKey === 'art-li-copy'
+                                  ? 'کپی شد'
+                                  : 'کپی پست لینکدین'}
+                              </button>
+                            </div>
+                            <p className="text-[#233b53] whitespace-pre-wrap leading-relaxed">
+                              {aiResult.linkedinPostSnippet}
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* A. STORYCANVAS INJECTION CARDS (from 6-module enterprise canvas_slides) */}
                 {enterpriseSlides.length > 0 && (
                   <div className="space-y-2.5">
@@ -1750,7 +2491,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                   </div>
                 )}
 
-                {/* B. /video RICH OUTPUT VISUALIZER (3 Hook Cards + 5-Column Storyboard Table + Veo Prompt Copy) */}
+                {/* B. /video RICH OUTPUT VISUALIZER */}
                 {videoProd && (
                   <div className="space-y-3.5">
                     {videoProd.brief && (
@@ -1776,7 +2517,6 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                       </div>
                     )}
 
-                    {/* 3-Way Hook Arsenal */}
                     {Array.isArray(videoProd.hooks) &&
                       videoProd.hooks.length > 0 && (
                         <div className="space-y-2">
@@ -1807,7 +2547,6 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                         </div>
                       )}
 
-                    {/* 5-Column Storyboard Table with Veo Prompt Copy + Google Sheets Export */}
                     {Array.isArray(videoProd.storyboard) &&
                       videoProd.storyboard.length > 0 && (
                         <div className="space-y-2">
@@ -1920,7 +2659,6 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                         </div>
                       )}
 
-                    {/* Video CTA & Caption */}
                     {videoProd.cta?.caption && (
                       <div className="p-3 rounded-xl bg-[#f5f8fa] border border-[#e3e9ed] space-y-1.5">
                         <div className="flex items-center justify-between">
@@ -2194,7 +2932,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                           key={qIdx}
                           type="button"
                           onClick={() => {
-                            setCustomPrompt((prev) =>
+                            setCustomPrompt(
                               `${
                                 activeSlashCommand || '/rpe'
                               } پاسخ به سوال «${q}»: `
@@ -2210,7 +2948,7 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                   </div>
                 )}
 
-                {/* 1. REELS & MOTION GRAPHICS SCRIPT OUTPUT (Standard Tab) */}
+                {/* 1. REELS & MOTION GRAPHICS SCRIPT OUTPUT */}
                 {mode === 'reels-script' && aiResult.scenes && (
                   <div className="space-y-3.5">
                     <div className="p-4 rounded-2xl bg-[#062959] text-white space-y-2">
@@ -2250,7 +2988,6 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                       </p>
                     </div>
 
-                    {/* 3 Hooks if returned */}
                     {Array.isArray(aiResult.threeHooks) &&
                       aiResult.threeHooks.length > 0 && (
                         <div className="space-y-2">
@@ -2274,7 +3011,6 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                         </div>
                       )}
 
-                    {/* Scenes List + Veo Prompt + Sheet export */}
                     <div className="space-y-2.5">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <span className="text-xs font-black text-[#062959]">

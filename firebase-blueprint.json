@@ -2,7 +2,7 @@
   "entities": {
     "AiGenerationRecord": {
       "title": "AiGenerationRecord",
-      "description": "Stores AI-generated Instagram scenarios, slides, captions, and sales campaigns created by a signed-in Google user in the Arka Studio.",
+      "description": "Stores AI-generated Instagram scenarios, slides, captions, SEO/AEO/GEO articles, and sales campaigns created by a signed-in Google user in Arka Studio.",
       "type": "object",
       "properties": {
         "userId": {
@@ -15,7 +15,14 @@
         "mode": {
           "type": "string",
           "description": "AI generation mode",
-          "enum": ["canvas-slide", "carousel-deck", "reels-script", "campaign-plan"],
+          "enum": [
+            "canvas-slide",
+            "carousel-deck",
+            "reels-script",
+            "campaign-plan",
+            "campaign-calendar-30",
+            "seo-article"
+          ],
           "minLength": 3,
           "maxLength": 40
         },
@@ -27,7 +34,7 @@
         },
         "title": {
           "type": "string",
-          "description": "Human-readable title of the generated scenario or campaign",
+          "description": "Human-readable title of the generated scenario, article, or campaign",
           "minLength": 1,
           "maxLength": 300
         },
@@ -35,7 +42,7 @@
           "type": "string",
           "description": "Serialized JSON payload of the generated AI content",
           "minLength": 2,
-          "maxLength": 25000
+          "maxLength": 60000
         },
         "createdAt": {
           "type": "string",
@@ -44,12 +51,62 @@
         }
       },
       "required": ["userId", "mode", "productId", "title", "contentJson", "createdAt"]
+    },
+    "UserPreferenceRecord": {
+      "title": "UserPreferenceRecord",
+      "description": "Per-user non-sensitive UI theme and connection mode preferences.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "darkMode": {
+          "type": "boolean"
+        },
+        "preferredConnectionMode": {
+          "type": "string",
+          "enum": ["gmail-authenticated", "custom-byok", "studio-creator-core"]
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["userId", "darkMode", "preferredConnectionMode", "updatedAt"]
+    },
+    "BrandProfileRecord": {
+      "title": "BrandProfileRecord",
+      "description": "Per-user reusable Brand Intelligence Hub profile for Arka Studio content generation.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "profileJson": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 20000
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["userId", "profileJson", "updatedAt"]
     }
   },
   "firestore": {
     "/users/{userId}/aiGenerations/{genId}": {
       "schema": { "$ref": "#/entities/AiGenerationRecord" },
-      "description": "Private per-user collection of AI-generated Arka Instagram campaigns, Reels scripts, and slides."
+      "description": "Private per-user collection of AI-generated Arka campaigns, SEO/AEO/GEO articles, Reels scripts, and slides."
+    },
+    "/users/{userId}/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/UserPreferenceRecord" },
+      "description": "Private per-user settings documents (preferences and brandProfile)."
     }
   }
 }

@@ -23,6 +23,20 @@ import {
   Timestamp,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
+import {
+  ArkaBrandProfile,
+  DEFAULT_ARKA_BRAND_PROFILE,
+} from './config/arkaCore';
+
+// Immediately purge any legacy plaintext API keys from browser storage on startup
+try {
+  if (typeof window !== 'undefined') {
+    window.localStorage?.removeItem('arka_custom_byok_v1');
+    window.sessionStorage?.removeItem('arka_custom_byok_v1');
+  }
+} catch {
+  // Ignore storage access errors
+}
 
 const app = initializeApp(firebaseConfig);
 const firestoreDbId =
@@ -104,7 +118,6 @@ export function handleFirestoreError(
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Validate connection to Firestore on boot
 async function testConnection() {
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
@@ -119,9 +132,8 @@ async function testConnection() {
 }
 testConnection();
 
-// Flag to indicate if we are in the middle of a sign-in flow.
 let isSigningInFlow = false;
-// Cache the access token in memory ONLY (never stored in localStorage/sessionStorage).
+// Cache the Workspace OAuth access token in memory ONLY (never stored in localStorage/sessionStorage).
 let cachedAccessToken: string | null = null;
 
 export const initAuth = (
@@ -225,7 +237,8 @@ export type AiGenMode =
   | 'carousel-deck'
   | 'reels-script'
   | 'campaign-plan'
-  | 'campaign-calendar-30';
+  | 'campaign-calendar-30'
+  | 'seo-article';
 
 export interface SavedAiGenerationItem {
   id: string;
@@ -297,7 +310,7 @@ export async function fetchUserAiGenerations(): Promise<
       collection(db, 'users', currentUser.uid, 'aiGenerations'),
       where('userId', '==', currentUser.uid),
       orderBy('createdAt', 'desc'),
-      limit(15)
+      limit(20)
     );
     const snap = await getDocs(q);
     return snap.docs.map((d) => {
@@ -390,3 +403,46 @@ export async function fetchUserStudioPreferences(): Promise<UserStudioPreference
   }
 }
 
+export async function saveUserBrandProfile(
+  profile: ArkaBrandProfile
+): Promise<void> {
+  const currentUser = auth.currentUser;
+  if (!currentUser) return;
+
+  const path = `users/${currentUser.uid}/settings/brandProfile`;
+  const serialized = JSON.stringify(profile).slice(0, 18000);
+  try {
+    await setDoc(
+      doc(db, 'users', currentUser.uid, 'settings', 'brandProfile'),
+      {
+        userId: currentUser.uid,
+        profileJson: serialized,
+        updatedAt: serverTimestamp(),
+      }
+    );
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function fetchUserBrandProfile(): Promise<ArkaBrandProfile | null> {
+  const currentUser = auth.currentUser;
+  if (!currentUser) return null;
+
+  const path = `users/${currentUser.uid}/settings/brandProfile`;
+  try {
+    const snap = await getDoc(
+      doc(db, 'users', currentUser.uid, 'settings', 'brandProfile')
+    );
+    if (!snap.exists()) return null;
+    const data = snap.data();
+    if (!data?.profileJson) return null;
+    const parsed = JSON.parse(String(data.profileJson));
+    return {
+      ...DEFAULT_ARKA_BRAND_PROFILE,
+      ...parsed,
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+}

@@ -8,6 +8,225 @@ export type ArkaMode =
 
 export type GeminiRouterModelId = 'gemini-2.5-flash' | 'gemini-2.5-pro';
 
+export type GeminiTaskCapability =
+  | 'text_generation'
+  | 'structured_json'
+  | 'deep_reasoning'
+  | 'seo_aeo_geo_article'
+  | 'image_prompt_matrix'
+  | 'video_storyboard'
+  | 'image_generation'
+  | 'video_generation';
+
+export interface GeminiModelCapabilitySpec {
+  id: string;
+  displayName: string;
+  tier: 'pro' | 'flash' | 'specialized';
+  supportsText: boolean;
+  supportsStructuredJson: boolean;
+  supportsDeepReasoning: boolean;
+  supportsSearchGrounding: boolean;
+  supportsImageGeneration: boolean;
+  supportsVideoGeneration: boolean;
+  recommendedTasks: GeminiTaskCapability[];
+  notesFa: string;
+}
+
+export const GEMINI_MODEL_CAPABILITY_REGISTRY: Record<
+  string,
+  GeminiModelCapabilitySpec
+> = {
+  'gemini-2.5-pro': {
+    id: 'gemini-2.5-pro',
+    displayName: 'Gemini 2.5 Pro (استدلال عمیق و معماری محتوا)',
+    tier: 'pro',
+    supportsText: true,
+    supportsStructuredJson: true,
+    supportsDeepReasoning: true,
+    supportsSearchGrounding: true,
+    supportsImageGeneration: false,
+    supportsVideoGeneration: false,
+    recommendedTasks: [
+      'text_generation',
+      'structured_json',
+      'deep_reasoning',
+      'seo_aeo_geo_article',
+      'image_prompt_matrix',
+      'video_storyboard',
+    ],
+    notesFa:
+      'مناسب برای مقالات SEO/AEO/GEO، تقویم کمپین ۳۰ روزه، سناریوی ریلز، ماتریس بصری و معماری RPE.',
+  },
+  'gemini-2.5-flash': {
+    id: 'gemini-2.5-flash',
+    displayName: 'Gemini 2.5 Flash (پرشتاب و کم‌هزینه)',
+    tier: 'flash',
+    supportsText: true,
+    supportsStructuredJson: true,
+    supportsDeepReasoning: false,
+    supportsSearchGrounding: true,
+    supportsImageGeneration: false,
+    supportsVideoGeneration: false,
+    recommendedTasks: [
+      'text_generation',
+      'structured_json',
+      'seo_aeo_geo_article',
+      'image_prompt_matrix',
+      'video_storyboard',
+    ],
+    notesFa:
+      'مناسب برای اجرای سریع (/fast)، پیش‌نویس‌های ترکیبی (/hybrid) و مدل جایگزین در زمان محدودیت سهمیه Pro.',
+  },
+  'gemini-2.5-flash-image': {
+    id: 'gemini-2.5-flash-image',
+    displayName: 'Gemini 2.5 Flash Image (تولید و ویرایش تصویر)',
+    tier: 'specialized',
+    supportsText: true,
+    supportsStructuredJson: false,
+    supportsDeepReasoning: false,
+    supportsSearchGrounding: false,
+    supportsImageGeneration: true,
+    supportsVideoGeneration: false,
+    recommendedTasks: ['image_generation'],
+    notesFa: 'مختص رندر مستقیم تصویر؛ برای خروجی JSON ساختاریافته استفاده نمی‌شود.',
+  },
+  'veo-2.0-generate-001': {
+    id: 'veo-2.0-generate-001',
+    displayName: 'Veo 2.0 Video Generator (رندر ویدیو)',
+    tier: 'specialized',
+    supportsText: false,
+    supportsStructuredJson: false,
+    supportsDeepReasoning: false,
+    supportsSearchGrounding: false,
+    supportsImageGeneration: false,
+    supportsVideoGeneration: true,
+    recommendedTasks: ['video_generation'],
+    notesFa: 'مختص تولید ویدیو از روی پرامپت انگلیسی استوری‌بورد.',
+  },
+};
+
+export function validateModelCapabilityForTask(
+  modelId: string,
+  requiredCapability: GeminiTaskCapability
+): { supported: boolean; reasonFa?: string } {
+  const normalized = modelId.replace(/^models\//, '').trim();
+  const spec =
+    GEMINI_MODEL_CAPABILITY_REGISTRY[normalized] ||
+    (normalized.includes('2.5-pro')
+      ? GEMINI_MODEL_CAPABILITY_REGISTRY['gemini-2.5-pro']
+      : normalized.includes('2.5-flash')
+      ? GEMINI_MODEL_CAPABILITY_REGISTRY['gemini-2.5-flash']
+      : null);
+
+  if (!spec) {
+    return {
+      supported: false,
+      reasonFa: `مدل «${normalized}» در رجیستری قابلیت‌های تاییدشده استودیو آرکا یافت نشد.`,
+    };
+  }
+
+  if (
+    requiredCapability === 'structured_json' &&
+    !spec.supportsStructuredJson
+  ) {
+    return {
+      supported: false,
+      reasonFa: `مدل «${spec.displayName}» از خروجی ساختاریافته JSON (responseSchema) پشتیبانی نمی‌کند.`,
+    };
+  }
+
+  if (
+    requiredCapability === 'image_generation' &&
+    !spec.supportsImageGeneration
+  ) {
+    return {
+      supported: false,
+      reasonFa: `مدل متنی «${spec.displayName}» قابلیت رندر مستقیم پیکسل تصویر را ندارد (فقط مهندسی پرامپت تصویر و اسلاید بوم را انجام می‌دهد).`,
+    };
+  }
+
+  if (
+    requiredCapability === 'video_generation' &&
+    !spec.supportsVideoGeneration
+  ) {
+    return {
+      supported: false,
+      reasonFa: `مدل «${spec.displayName}» قابلیت رندر مستقیم فایل ویدیویی را ندارد (کارگردانی استوری‌بورد و پرامپت Veo را تولید می‌کند).`,
+    };
+  }
+
+  return { supported: true };
+}
+
+export type ArkaAiErrorCode =
+  | 'INVALID_API_KEY'
+  | 'AUTH_REQUIRED'
+  | 'BYOK_KEY_REQUIRED'
+  | 'PERMISSION_DENIED'
+  | 'QUOTA_EXCEEDED'
+  | 'MODEL_UNAVAILABLE'
+  | 'UNSUPPORTED_CAPABILITY'
+  | 'RATE_LIMITED'
+  | 'VALIDATION_ERROR'
+  | 'NETWORK_TIMEOUT'
+  | 'UPSTREAM_ERROR';
+
+export interface ClassifiedAiError {
+  errorCode: ArkaAiErrorCode;
+  httpStatus: number;
+  messageFa: string;
+  technicalReason?: string;
+  retryable: boolean;
+  canFallbackToFlash: boolean;
+  suggestedFallbackModel: GeminiRouterModelId | null;
+  attemptedModel?: string;
+  retryAfterSeconds?: number;
+}
+
+export interface ArkaBrandProfile {
+  brandName: string;
+  tagline: string;
+  websiteUrl: string;
+  demoUrl: string;
+  taxLandingUrl: string;
+  phone: string;
+  headquarters: string;
+  coreValueProposition: string;
+  targetAudienceSegments: string;
+  toneOfVoice: string;
+  visualIdentityNotes: string;
+  competitivePositioning: string;
+  marketingObjectives: string;
+  focusKeywords: string;
+  internalLinkPillars: string;
+}
+
+export const DEFAULT_ARKA_BRAND_PROFILE: ArkaBrandProfile = {
+  brandName: 'گروه نرم‌افزاری آرکا (Arka Software Group)',
+  tagline: 'راهنمای هوشمند کسب‌وکار · یکپارچگی کامل برای تصمیم‌گیری سریع‌تر و دقیق‌تر',
+  websiteUrl: 'https://arka-acc.ir',
+  demoUrl: 'https://arka-acc.ir/demo',
+  taxLandingUrl: 'https://arka-acc.ir/pages/tax',
+  phone: '051-36079047',
+  headquarters: 'مشهد - سید رضی ۴۰ - بین مهران ۹ و ۱۱ - پلاک ۲۶۵ - طبقه اول',
+  coreValueProposition:
+    'نسخه دموی رایگان تا سقف ۱۰۰ سند واقعی با داده‌های کسب‌وکار مشتری، ۱ سال پشتیبانی رایگان + آرکا آکادمی، اتصال مستقیم و بدون واسطه به سامانه مؤدیان مالیاتی و ۸ نرم‌افزار تخصصی یکپارچه (جامع، پاچال، سوله، ترخیص، منو، پروژه، ویترین، شتاب).',
+  targetAudienceSegments:
+    'مدیران عامل SMEها، مدیران مالی و حسابداران، فروشگاه‌ها و هایپرمارکت‌ها (پاچال)، کارگاه‌ها و تولیدی‌ها (سوله)، شرکت‌های بازرگانی (ترخیص)، رستوران‌ها و کافه‌ها (منو)، شرکت‌های پیمانکاری (پروژه)، آنلاین‌شاپ‌ها (ویترین) و استارتاپ‌ها (شتاب).',
+  toneOfVoice:
+    'حرفه‌ای، داده‌محور، مقتدر اما صمیمی، دغدغه‌شناس و متمرکز بر تبدیل ویژگی‌های فنی به سود و آرامش مالی مدیران.',
+  visualIdentityNotes:
+    'سرمه‌ای عمیق سازمانی (#062959)، فیروزه‌ای درخشان آرکا (#08cdbd / #14dac3)، پس‌زمینه تیره استودیویی (#07090E) و تایپوگرافی استاندارد وزیرمتن (Vazirmatn).',
+  competitivePositioning:
+    'برخلاف نرم‌افزارهای سنتی و پیچیده یا ابزارهای ناقص، آرکا تنها اکوسیستمی است که با ۱ ثبت فاکتور، هم‌زمان انبار، خزانه‌داری، سود و زیان و صورتحساب الکترونیکی سامانه مؤدیان را بروزرسانی می‌کند و قبل از خرید، ۱۰۰ سند واقعی رایگان ارائه می‌دهد.',
+  marketingObjectives:
+    'جذب سرنخ (Lead Generation) از طریق دانلود دموی رایگان ۱۰۰ سند (arka-acc.ir/demo)، افزایش تماس‌های مشاوره فروش (051-36079047) و تثبیت جایگاه مرجع در سئو و موتورهای پاسخ‌گوی هوش مصنوعی (SEO/AEO/GEO) در حوزه نرم‌افزار حسابداری و سامانه مؤدیان.',
+  focusKeywords:
+    'نرم افزار حسابداری آرکا، ارسال صورتحساب سامانه مودیان، دانلود رایگان نرم افزار حسابداری، نرم افزار حسابداری فروشگاهی پاچال، حسابداری تولیدی سوله، حسابداری آنلاین شاپ ویترین',
+  internalLinkPillars:
+    'https://arka-acc.ir (صفحه اصلی) | https://arka-acc.ir/demo (دموی رایگان ۱۰۰ سند) | https://arka-acc.ir/products (کاتالوگ ۸ سیستم) | https://arka-acc.ir/pages/tax (سرویس سامانه مؤدیان)',
+};
+
 export interface SlashCommandConfig {
   command: '/fast' | '/hybrid' | '/rpe' | '/visual' | '/video' | '/copy';
   label: string;
@@ -76,7 +295,7 @@ export const ARKA_SLASH_COMMANDS: SlashCommandConfig[] = [
 ];
 
 export const ARKA_SYSTEM_INSTRUCTION = `# ROLE & ORGANIZATIONAL IDENTITY
-تو «هسته مرکزی هوشمند استودیو آرکا (Arka Studio Enterprise Core)» هستی؛ موتور استراتژیک، کارگردان هنری، طراح اسلایدهای گرافیکی و مهندس کپی‌رایتینگ که به صورت اختصاصی برای اکوسیستم «آرکا» (نرم‌افزار حسابداری آرکا https://arka-acc.ir، کاتالوگ ۸ سیستم یکپارچه آرکا، سرویس مستقیم سامانه مؤدیان و نسخه دموی رایگان ۱۰۰ سند) طراحی شده‌ای.
+تو «هسته مرکزی هوشمند استودیو آرکا (Arka Studio Enterprise Core)» هستی؛ موتور استراتژیک، کارگردان هنری، طراح اسلایدهای گرافیکی، مهندس سئو (SEO/AEO/GEO) و مهندس کپی‌رایتینگ که به صورت اختصاصی برای اکوسیستم «آرکا» (نرم‌افزار حسابداری آرکا https://arka-acc.ir، کاتالوگ ۸ سیستم یکپارچه آرکا، سرویس مستقیم سامانه مؤدیان و نسخه دموی رایگان ۱۰۰ سند) طراحی شده‌ای.
 هدف تو بی‌نیاز کردن کامل سازمان از هرگونه هوش مصنوعی ثانویه است. خروجی‌های تو هرگز خام یا کلیشه‌ای نیستند، بلکه «محصول نهایی، پولیش‌خورده، منطبق بر کانتکست زنده سایت و آماده تزریق مستقیم به بوم گرافیکی (StoryCanvas)» هستند.
 
 # 6-MODULE OPERATIONAL ARCHITECTURE
@@ -170,6 +389,7 @@ export interface CanvasSlideSchemaItem {
 export interface AutoModelDecision {
   modelId: GeminiRouterModelId;
   fallbackModelId: GeminiRouterModelId;
+  requiredCapability: GeminiTaskCapability;
   modelDisplayName: string;
   detectedArkaMode: ArkaMode;
   detectedSlashCommand: string | null;
@@ -177,9 +397,9 @@ export interface AutoModelDecision {
 }
 
 /**
- * Smart Model Router:
+ * Capability-Aware Smart Model Router:
  * - /fast or lightweight non-JSON tasks -> gemini-2.5-flash
- * - /rpe, /video, /visual, /copy, StoryCanvas slide generation, or JSON outputs -> gemini-2.5-pro (with auto fallback to gemini-2.5-flash)
+ * - /rpe, /video, /visual, /copy, seo-article, StoryCanvas slide generation, or JSON outputs -> gemini-2.5-pro (with explicit user-controlled fallback to gemini-2.5-flash)
  */
 export function resolveSmartModelForTask(
   customPrompt: string,
@@ -196,12 +416,13 @@ export function resolveSmartModelForTask(
   );
 
   if (matchedSlash) {
-    // /fast -> always gemini-2.5-flash unless explicitly forced heavy JSON canvas architecture
     if (matchedSlash.mode === 'fast_path' && !isJsonRequested) {
       return {
         modelId: 'gemini-2.5-flash',
         fallbackModelId: 'gemini-2.5-flash',
-        modelDisplayName: 'gemini-2.5-flash (انتخاب خودکار برای اجرای سریع /fast)',
+        requiredCapability: 'text_generation',
+        modelDisplayName:
+          'gemini-2.5-flash (انتخاب خودکار برای اجرای سریع /fast)',
         detectedArkaMode: 'fast_path',
         detectedSlashCommand: '/fast',
         reasoningFa:
@@ -209,11 +430,17 @@ export function resolveSmartModelForTask(
       };
     }
 
-    if (matchedSlash.mode === 'hybrid' && !isJsonRequested && trimmed.length < 180) {
+    if (
+      matchedSlash.mode === 'hybrid' &&
+      !isJsonRequested &&
+      trimmed.length < 180
+    ) {
       return {
         modelId: 'gemini-2.5-flash',
         fallbackModelId: 'gemini-2.5-flash',
-        modelDisplayName: 'gemini-2.5-flash (انتخاب خودکار برای پیش‌نویس سریع /hybrid)',
+        requiredCapability: 'structured_json',
+        modelDisplayName:
+          'gemini-2.5-flash (انتخاب خودکار برای پیش‌نویس سریع /hybrid)',
         detectedArkaMode: 'hybrid',
         detectedSlashCommand: '/hybrid',
         reasoningFa:
@@ -223,9 +450,9 @@ export function resolveSmartModelForTask(
 
     const modeReasonMap: Record<ArkaMode, string> = {
       fast_path:
-        'تشخیص دستور /fast با خروجی JSON ← انتخاب خودکار gemini-2.5-pro (با فالبک به gemini-2.5-flash)',
+        'تشخیص دستور /fast با خروجی JSON ← انتخاب خودکار gemini-2.5-pro (امکان تلاش مجدد با gemini-2.5-flash)',
       hybrid:
-        'تشخیص دستور /hybrid ساختاریافته ← انتخاب خودکار gemini-2.5-pro (با فالبک به gemini-2.5-flash)',
+        'تشخیص دستور /hybrid ساختاریافته ← انتخاب خودکار gemini-2.5-pro (امکان تلاش مجدد با gemini-2.5-flash)',
       deep_rpe:
         'تشخیص دستور استراتژیک /rpe (معماری عمیق برند) ← انتخاب خودکار gemini-2.5-pro',
       visual_matrix:
@@ -241,13 +468,24 @@ export function resolveSmartModelForTask(
       hybrid: 'gemini-2.5-pro (حالت ترکیبی پیشرفته)',
       deep_rpe: 'gemini-2.5-pro (انتخاب خودکار برای معماری عمیق /rpe)',
       visual_matrix: 'gemini-2.5-pro (انتخاب خودکار برای ماتریس بصری /visual)',
-      video_director: 'gemini-2.5-pro (انتخاب خودکار برای کارگردانی ویدیو /video)',
+      video_director:
+        'gemini-2.5-pro (انتخاب خودکار برای کارگردانی ویدیو /video)',
       copy_engine: 'gemini-2.5-pro (انتخاب خودکار برای مهندسی کپی /copy)',
+    };
+
+    const capabilityMap: Record<ArkaMode, GeminiTaskCapability> = {
+      fast_path: 'structured_json',
+      hybrid: 'structured_json',
+      deep_rpe: 'deep_reasoning',
+      visual_matrix: 'image_prompt_matrix',
+      video_director: 'video_storyboard',
+      copy_engine: 'structured_json',
     };
 
     return {
       modelId: 'gemini-2.5-pro',
       fallbackModelId: 'gemini-2.5-flash',
+      requiredCapability: capabilityMap[matchedSlash.mode],
       modelDisplayName: modeLabelMap[matchedSlash.mode],
       detectedArkaMode: matchedSlash.mode,
       detectedSlashCommand: matchedSlash.command,
@@ -255,9 +493,9 @@ export function resolveSmartModelForTask(
     };
   }
 
-  // Infer from active Studio Tab when no slash command is typed
   const heavyTabs = new Set([
     'campaign-calendar-30',
+    'seo-article',
     'reels-script',
     'carousel-deck',
     'canvas-slide',
@@ -266,10 +504,12 @@ export function resolveSmartModelForTask(
 
   if (heavyTabs.has(studioTabMode) || isJsonRequested) {
     const tabReason =
-      studioTabMode === 'reels-script'
-        ? 'سناریو و کارگردانی ریلز ← انتخاب خودکار gemini-2.5-pro (با فالبک خودکار به gemini-2.5-flash)'
+      studioTabMode === 'seo-article'
+        ? 'مهندسی مقاله جامع SEO / AEO / GEO + اسکیمای FAQ و لینک‌سازی داخلی ← انتخاب خودکار gemini-2.5-pro'
+        : studioTabMode === 'reels-script'
+        ? 'سناریو و کارگردانی ریلز ← انتخاب خودکار gemini-2.5-pro'
         : studioTabMode === 'campaign-calendar-30'
-        ? 'معماری تقویم ۳۰ روزه چرخه محصولات ← انتخاب خودکار gemini-2.5-pro (با فالبک به gemini-2.5-flash)'
+        ? 'معماری تقویم ۳۰ روزه چرخه محصولات ← انتخاب خودکار gemini-2.5-pro'
         : studioTabMode === 'carousel-deck'
         ? 'طراحی کاروسل ۵ اسلایدی پیوسته ← انتخاب خودکار gemini-2.5-pro'
         : 'تولید اسلاید ساختاریافته StoryCanvas و خروجی JSON ← انتخاب خودکار gemini-2.5-pro';
@@ -277,17 +517,29 @@ export function resolveSmartModelForTask(
     const detectedMode: ArkaMode =
       studioTabMode === 'reels-script'
         ? 'video_director'
-        : studioTabMode === 'carousel-deck'
+        : studioTabMode === 'carousel-deck' || studioTabMode === 'seo-article'
         ? 'copy_engine'
         : studioTabMode === 'canvas-slide'
         ? 'visual_matrix'
         : 'deep_rpe';
 
+    const requiredCap: GeminiTaskCapability =
+      studioTabMode === 'seo-article'
+        ? 'seo_aeo_geo_article'
+        : studioTabMode === 'reels-script'
+        ? 'video_storyboard'
+        : studioTabMode === 'canvas-slide'
+        ? 'image_prompt_matrix'
+        : 'structured_json';
+
     return {
       modelId: 'gemini-2.5-pro',
       fallbackModelId: 'gemini-2.5-flash',
+      requiredCapability: requiredCap,
       modelDisplayName:
-        studioTabMode === 'reels-script'
+        studioTabMode === 'seo-article'
+          ? 'gemini-2.5-pro (مهندسی مقاله SEO/AEO/GEO)'
+          : studioTabMode === 'reels-script'
           ? 'gemini-2.5-pro (کارگردانی ویدیو)'
           : studioTabMode === 'campaign-calendar-30'
           ? 'gemini-2.5-pro (معماری تقویم ۳۰ روزه)'
@@ -301,6 +553,7 @@ export function resolveSmartModelForTask(
   return {
     modelId: 'gemini-2.5-flash',
     fallbackModelId: 'gemini-2.5-flash',
+    requiredCapability: 'text_generation',
     modelDisplayName: 'gemini-2.5-flash (پرشتاب و بهینه)',
     detectedArkaMode: 'fast_path',
     detectedSlashCommand: null,

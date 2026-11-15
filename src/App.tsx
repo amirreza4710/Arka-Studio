@@ -44,12 +44,16 @@ import {
   saveUserStudioPreferences,
   fetchUserStudioPreferences,
   getAccessToken,
-  getFirebaseIdToken,
 } from './firebase';
 import {
   ArkaConnectionSource,
   CanvasSlideSchemaItem,
 } from './config/arkaCore';
+import {
+  fetchByokVaultStatus,
+  verifyAndSaveByokKeyToServerVault,
+  deleteByokKeyFromServerVault,
+} from './services/arkaAiClient';
 import {
   Download,
   ChevronRight,
@@ -81,13 +85,11 @@ import {
   AlertCircle,
   X,
   Trash2,
-  ExternalLink,
 } from 'lucide-react';
 
 const STORAGE_KEY = 'arka_story_studio_v2';
 const CAROUSEL_STORAGE_KEY = 'arka_carousel_decks_v2';
 const ACTIVE_CONFIG_STORAGE_KEY = 'arka_story_active_config_v2';
-const CUSTOM_BYOK_STORAGE_KEY = 'arka_custom_byok_v1';
 
 type MobileTabId = 'preview' | 'ai-studio' | 'editor' | 'workspace' | 'gallery';
 type DesktopSidePanelMode = 'ai-studio' | 'editor' | 'workspace';
@@ -337,43 +339,17 @@ export default function App() {
       return 'studio-creator-core';
     });
 
-  // Custom BYOK (Bring Your Own Key) state stored strictly in browser localStorage (never Firestore)
-  const [customApiKey, setCustomApiKey] = useState<string>(() => {
-    try {
-      const raw = localStorage.getItem(CUSTOM_BYOK_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        return String(parsed.key || '');
-      }
-    } catch {
-      // Ignore
-    }
-    return '';
-  });
-
+  // Server-Side Encrypted BYOK Vault metadata (no plaintext key ever stored in browser storage)
   const [customKeyVerifiedInfo, setCustomKeyVerifiedInfo] =
-    useState<CustomKeyVerifiedInfo | null>(() => {
-      try {
-        const raw = localStorage.getItem(CUSTOM_BYOK_STORAGE_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (parsed.verifiedInfo?.valid) {
-            return parsed.verifiedInfo;
-          }
-        }
-      } catch {
-        // Ignore
-      }
-      return null;
-    });
+    useState<CustomKeyVerifiedInfo | null>(null);
 
   // Auth & API Key Management Modal State
   const [isAuthKeyModalOpen, setIsAuthKeyModalOpen] = useState<boolean>(false);
-  const [byokDraftInput, setByokDraftInput] = useState<string>(customApiKey);
+  const [byokDraftInput, setByokDraftInput] = useState<string>('');
   const [isTestingByok, setIsTestingByok] = useState<boolean>(false);
   const [byokVerifyError, setByokVerifyError] = useState<string | null>(null);
   const [byokDraftVerifiedInfo, setByokDraftVerifiedInfo] =
-    useState<CustomKeyVerifiedInfo | null>(customKeyVerifiedInfo);
+    useState<CustomKeyVerifiedInfo | null>(null);
 
   // Explicit User Confirmation Modal for Workspace Write Actions (Drive PNG / Sheets Write)
   const [workspaceConfirmModal, setWorkspaceConfirmModal] = useState<{
@@ -385,7 +361,35 @@ export default function App() {
   const [isExecutingWorkspaceConfirm, setIsExecutingWorkspaceConfirm] =
     useState<boolean>(false);
 
-  // Initialize Firebase Auth & Workspace Token state + load cloud preferences
+  const syncServerByokVaultStatus = React.useCallback(async () => {
+    try {
+      const vault = await fetchByokVaultStatus();
+      if (vault.configured && vault.maskedKey) {
+        const info: CustomKeyVerifiedInfo = {
+          valid: true,
+          maskedKey: vault.maskedKey,
+          models: vault.models,
+          hasPro: vault.hasPro,
+          hasFlash: vault.hasFlash,
+          checkedAt: vault.updatedAt
+            ? new Intl.DateTimeFormat('fa-IR', {
+                hour: '2-digit',
+                minute: '2-digit',
+              }).format(new Date(vault.updatedAt))
+            : 'ذخیره‌شده در گاوصندوق سرور',
+        };
+        setCustomKeyVerifiedInfo(info);
+        setByokDraftVerifiedInfo(info);
+      } else {
+        setCustomKeyVerifiedInfo(null);
+        setByokDraftVerifiedInfo(null);
+      }
+    } catch {
+      // Ignore vault check failure when offline
+    }
+  }, []);
+
+  // Initialize Firebase Auth & Workspace Token state + load cloud preferences & BYOK vault status
   useEffect(() => {
     const unsub = initAuth(
       (user, token) => {
@@ -393,6 +397,7 @@ export default function App() {
         setAccessToken(token);
         setNeedsAuth(false);
         setLastAuthError(null);
+        syncServerByokVaultStatus();
         fetchUserStudioPreferences()
           .then((prefs) => {
             if (prefs) {
@@ -414,6 +419,7 @@ export default function App() {
             'Auth',
             `نشست Firebase Auth بازیابی شد (${user.email}) · ID Token برای هوش مصنوعی آماده است (برای Drive/Sheets تمدید پاپ‌آپ لازم است).`
           );
+          syncServerByokVaultStatus();
           fetchUserStudioPreferences()
             .then((prefs) => {
               if (prefs) {
@@ -424,11 +430,14 @@ export default function App() {
             .catch(() => {
               // Ignore
             });
+        } else {
+          setCustomKeyVerifiedInfo(null);
+          setByokDraftVerifiedInfo(null);
         }
       }
     );
     return () => unsub();
-  }, [emitTelemetryLog]);
+  }, [emitTelemetryLog, syncServerByokVaultStatus]);
 
   // Robust ResizeObserver for dynamic container scale calculation
   useEffect(() => {
@@ -576,31 +585,14 @@ export default function App() {
     setIsTestingByok(true);
     setByokVerifyError(null);
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      };
-      const idToken = await getFirebaseIdToken();
-      if (idToken) {
-        headers.Authorization = `Bearer ${idToken}`;
-      }
-
-      const resp = await fetch('/api/arka-ai/verify-key', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          customApiKey: trimmed,
-          provider: 'gemini',
-        }),
+      const data = await verifyAndSaveByokKeyToServerVault({
+        apiKey: trimmed,
+        saveToVault: false,
       });
-      const data = await resp.json();
-      if (!resp.ok || !data?.ok || !data?.valid) {
-        throw new Error(
-          data?.error || 'اعتبارسنجی کلید ناموفق بود. کلید را بررسی کنید.'
-        );
-      }
 
       const info: CustomKeyVerifiedInfo = {
         valid: true,
+        maskedKey: data.maskedKey,
         models: Array.isArray(data.models) ? data.models : [],
         hasPro: Boolean(data.hasPro),
         hasFlash: Boolean(data.hasFlash),
@@ -622,45 +614,78 @@ export default function App() {
     }
   };
 
-  const handleSaveVerifiedByokKey = () => {
+  const handleSaveVerifiedByokKey = async () => {
     const trimmed = byokDraftInput.trim();
-    if (!trimmed || !byokDraftVerifiedInfo?.valid) return;
-    setCustomApiKey(trimmed);
-    setCustomKeyVerifiedInfo(byokDraftVerifiedInfo);
-    try {
-      localStorage.setItem(
-        CUSTOM_BYOK_STORAGE_KEY,
-        JSON.stringify({
-          key: trimmed,
-          verifiedInfo: byokDraftVerifiedInfo,
-        })
-      );
-    } catch {
-      // Ignore
+    if (!trimmed) {
+      setByokVerifyError('لطفاً کلید Gemini API Key را برای رمزنگاری و ذخیره در سرور وارد کنید.');
+      return;
     }
-    handleChangeConnectionMode('custom-byok');
-    setIsAuthKeyModalOpen(false);
-    setExportStatusMessage(
-      'کلید API شخصی شما با موفقیت ذخیره و به عنوان منبع فعال انتخاب شد.'
-    );
-    setTimeout(() => setExportStatusMessage(null), 3500);
-  };
-
-  const handleClearCustomByokKey = () => {
-    setCustomApiKey('');
-    setCustomKeyVerifiedInfo(null);
-    setByokDraftInput('');
-    setByokDraftVerifiedInfo(null);
+    if (!currentUser) {
+      setByokVerifyError('برای ذخیره امن و رمزنگاری کلید شخصی در گاوصندوق سرور، ابتدا با حساب گوگل وارد شوید.');
+      return;
+    }
+    setIsTestingByok(true);
     setByokVerifyError(null);
     try {
-      localStorage.removeItem(CUSTOM_BYOK_STORAGE_KEY);
-    } catch {
-      // Ignore
+      const data = await verifyAndSaveByokKeyToServerVault({
+        apiKey: trimmed,
+        saveToVault: true,
+      });
+
+      const info: CustomKeyVerifiedInfo = {
+        valid: true,
+        maskedKey: data.maskedKey,
+        models: Array.isArray(data.models) ? data.models : [],
+        hasPro: Boolean(data.hasPro),
+        hasFlash: Boolean(data.hasFlash),
+        checkedAt: data.checkedAt || 'الان',
+      };
+      setCustomKeyVerifiedInfo(info);
+      setByokDraftVerifiedInfo(info);
+      setByokDraftInput(''); // Immediately purge raw key from browser memory after server vault encryption
+      handleChangeConnectionMode('custom-byok');
+      setIsAuthKeyModalOpen(false);
+      emitTelemetryLog(
+        'ok',
+        'Auth',
+        `کلید API شخصی با رمزنگاری AES-256-GCM در گاوصندوق سرور ذخیره شد (${info.maskedKey || 'Masked'}).`
+      );
+      setExportStatusMessage(
+        'کلید API شخصی شما با رمزنگاری AES-256-GCM در سرور ذخیره و فعال شد (هیچ کلیدی در مرورگر ذخیره نمی‌شود).'
+      );
+      setTimeout(() => setExportStatusMessage(null), 4000);
+    } catch (err: any) {
+      const msg = err?.message || 'خطا در ذخیره کلید در گاوصندوق سرور.';
+      setByokVerifyError(msg);
+      emitTelemetryLog('error', 'Auth', `ذخیره کلید در سرور ناموفق: ${msg}`);
+    } finally {
+      setIsTestingByok(false);
     }
-    handleChangeConnectionMode(
-      currentUser ? 'gmail-authenticated' : 'studio-creator-core'
-    );
-    emitTelemetryLog('warn', 'Auth', 'کلید API شخصی پاک شد و منبع به حالت پیش‌فرض بازگشت.');
+  };
+
+  const handleClearCustomByokKey = async () => {
+    setIsTestingByok(true);
+    try {
+      if (currentUser) {
+        await deleteByokKeyFromServerVault();
+      }
+      setCustomKeyVerifiedInfo(null);
+      setByokDraftInput('');
+      setByokDraftVerifiedInfo(null);
+      setByokVerifyError(null);
+      handleChangeConnectionMode(
+        currentUser ? 'gmail-authenticated' : 'studio-creator-core'
+      );
+      emitTelemetryLog(
+        'warn',
+        'Auth',
+        'کلید API شخصی از گاوصندوق رمزنگاری‌شده سرور حذف شد.'
+      );
+    } catch (err: any) {
+      setByokVerifyError(err?.message || 'خطا در حذف کلید از سرور.');
+    } finally {
+      setIsTestingByok(false);
+    }
   };
 
   const handleGoogleSignIn = async () => {
@@ -1432,7 +1457,7 @@ export default function App() {
   return (
     <div
       dir="rtl"
-      className={`min-h-screen bg-[#f5f8fa] text-[#233b53] flex flex-col pb-20 lg:pb-0 transition-colors ${
+      className={`min-h-screen overflow-x-hidden bg-[#f5f8fa] text-[#233b53] flex flex-col pb-20 lg:pb-0 transition-colors ${
         darkMode ? 'arka-dark-mode' : ''
       }`}
     >
@@ -1572,13 +1597,12 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                setByokDraftInput(customApiKey);
+                setByokDraftInput('');
                 setByokDraftVerifiedInfo(customKeyVerifiedInfo);
                 setByokVerifyError(null);
                 setIsAuthKeyModalOpen(true);
               }}
               className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-black transition-all cursor-pointer whitespace-nowrap shrink-0 min-h-[40px] ${
-                customApiKey &&
                 customKeyVerifiedInfo?.valid &&
                 preferredConnectionMode === 'custom-byok'
                   ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/50'
@@ -1587,12 +1611,11 @@ export default function App() {
                   ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/50'
                   : 'bg-purple-500/15 text-purple-300 border-purple-500/50'
               }`}
-              title="مدیریت اعتبار هوش مصنوعی و تست زنده کلید API شخصی (BYOK)"
+              title="مدیریت اعتبار هوش مصنوعی و گاوصندوق رمزنگاری‌شده کلید شخصی (BYOK)"
             >
               <KeyRound className="w-4 h-4 shrink-0" />
               <span>
-                {customApiKey &&
-                customKeyVerifiedInfo?.valid &&
+                {customKeyVerifiedInfo?.valid &&
                 preferredConnectionMode === 'custom-byok'
                   ? '🔵 کلید شخصی (BYOK)'
                   : currentUser &&
@@ -2104,12 +2127,11 @@ export default function App() {
                   isSignedIn: Boolean(currentUser),
                   email: currentUser?.email || null,
                   hasWorkspaceToken: Boolean(accessToken && !needsAuth),
-                  hasByokKey: Boolean(customApiKey && customKeyVerifiedInfo?.valid),
+                  hasByokKey: Boolean(customKeyVerifiedInfo?.valid),
                   creditSourceLabel:
-                    customApiKey &&
                     customKeyVerifiedInfo?.valid &&
                     preferredConnectionMode === 'custom-byok'
-                      ? 'کلید شخصی (BYOK)'
+                      ? `کلید شخصی در سرور (${customKeyVerifiedInfo.maskedKey || 'BYOK'})`
                       : currentUser &&
                         preferredConnectionMode === 'gmail-authenticated'
                       ? `اکانت جیمیل (${currentUser.email || 'متصل'})`
@@ -2119,7 +2141,7 @@ export default function App() {
                   lastAuthError,
                 }}
                 onOpenAuthKeyModal={() => {
-                  setByokDraftInput(customApiKey);
+                  setByokDraftInput('');
                   setByokDraftVerifiedInfo(customKeyVerifiedInfo);
                   setByokVerifyError(null);
                   setIsAuthKeyModalOpen(true);
@@ -2196,10 +2218,9 @@ export default function App() {
                   onWriteStructuredToSheet={handleRequestWriteStructuredToSheet}
                   preferredConnectionMode={preferredConnectionMode}
                   onChangeConnectionMode={handleChangeConnectionMode}
-                  customApiKey={customApiKey}
                   customKeyVerifiedInfo={customKeyVerifiedInfo}
                   onOpenAuthKeyModal={() => {
-                    setByokDraftInput(customApiKey);
+                    setByokDraftInput('');
                     setByokDraftVerifiedInfo(customKeyVerifiedInfo);
                     setByokVerifyError(null);
                     setIsAuthKeyModalOpen(true);
@@ -2592,11 +2613,64 @@ export default function App() {
                   >
                     {accessToken && !needsAuth
                       ? 'متصل ✓'
+                      : isSigningIn
+                      ? 'در حال تمدید توکن...'
                       : currentUser
                       ? 'نیاز به تمدید پاپ‌آپ'
                       : 'غیرفعال'}
                   </strong>
                 </span>
+              </div>
+
+              {/* Compact Progress Bar for Google Account & Workspace Token Renewal Status */}
+              <div className="pt-1 space-y-1">
+                <div className="flex items-center justify-between text-[10px] text-slate-400">
+                  <span>
+                    {isSigningIn
+                      ? 'در حال دریافت و تمدید توکن Google Workspace...'
+                      : accessToken && !needsAuth
+                      ? 'اتصال کامل گوگل و توکن Workspace فعال است'
+                      : currentUser
+                      ? 'نشست هوش مصنوعی فعال (در انتظار تمدید توکن Workspace)'
+                      : 'در انتظار ورود به حساب گوگل'}
+                  </span>
+                  <span className="font-mono font-bold text-[#14dac3] tabular-nums-fa">
+                    {isSigningIn
+                      ? '65%'
+                      : accessToken && !needsAuth
+                      ? '100%'
+                      : currentUser
+                      ? '50%'
+                      : '0%'}
+                  </span>
+                </div>
+                <div
+                  role="progressbar"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={
+                    isSigningIn
+                      ? 65
+                      : accessToken && !needsAuth
+                      ? 100
+                      : currentUser
+                      ? 50
+                      : 0
+                  }
+                  className="w-full h-1.5 rounded-full bg-slate-800 overflow-hidden"
+                >
+                  <div
+                    className={`h-full rounded-full transition-all duration-500 ${
+                      isSigningIn
+                        ? 'w-[65%] bg-gradient-to-l from-[#14dac3] to-amber-400 animate-pulse'
+                        : accessToken && !needsAuth
+                        ? 'w-full bg-gradient-to-l from-emerald-400 to-[#08cdbd]'
+                        : currentUser
+                        ? 'w-1/2 bg-amber-400'
+                        : 'w-0 bg-slate-600'
+                    }`}
+                  />
+                </div>
               </div>
 
               {lastAuthError && (
@@ -2641,10 +2715,9 @@ export default function App() {
 
               <button
                 type="button"
-                disabled={!customApiKey || !customKeyVerifiedInfo?.valid}
+                disabled={!customKeyVerifiedInfo?.valid}
                 onClick={() => handleChangeConnectionMode('custom-byok')}
                 className={`p-3 rounded-xl border text-right cursor-pointer transition-all disabled:opacity-50 ${
-                  customApiKey &&
                   customKeyVerifiedInfo?.valid &&
                   preferredConnectionMode === 'custom-byok'
                     ? 'bg-cyan-500/15 border-cyan-400 text-white'
@@ -2652,12 +2725,12 @@ export default function App() {
                 }`}
               >
                 <div className="font-black text-cyan-300">
-                  🔵 حالت ۲: کلید شخصی
+                  🔵 حالت ۲: کلید شخصی (Vault)
                 </div>
                 <div className="text-[10px] text-slate-400 mt-1">
-                  {customApiKey && customKeyVerifiedInfo?.valid
-                    ? 'کلید شخصی تاییدشده آماده اجرا'
-                    : 'ابتدا کلید را پایین تست و ذخیره کنید'}
+                  {customKeyVerifiedInfo?.valid
+                    ? `رمزنگاری‌شده در سرور (${customKeyVerifiedInfo.maskedKey || 'BYOK'})`
+                    : 'ابتدا کلید را پایین تست و در سرور ذخیره کنید'}
                 </div>
               </button>
 
@@ -2673,28 +2746,34 @@ export default function App() {
                 }`}
               >
                 <div className="font-black text-amber-300">
-                  🟠 کلید سازمانی آرکا
+                  🟠 کلید سازمانی آرکا (ویژه ادمین)
                 </div>
                 <div className="text-[10px] text-slate-400 mt-1">
-                  سرویس پیش‌فرض سرور استودیو آرکا
+                  فالبک مجاز سرور صرفاً برای ادمین تاییدشده
                 </div>
               </button>
             </div>
 
-            {/* Custom Gemini API Key BYOK Input + Live Test */}
+            {/* Custom Gemini API Key BYOK Input + Server-Side AES-256-GCM Vault */}
             <div className="p-4 rounded-xl bg-[#07090E] border border-slate-800 space-y-3">
-              <div className="flex items-center justify-between">
-                <label className="text-xs font-black text-[#14dac3]">
-                  ورود کلید API شخصی (Google Gemini API Key)
-                </label>
-                {customApiKey && (
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <label className="text-xs font-black text-[#14dac3] block">
+                    گاوصندوق کلید شخصی Gemini (Server-Side AES-256-GCM Vault)
+                  </label>
+                  <span className="text-[10px] text-slate-400">
+                    کلید هرگز در مرورگر ذخیره نمی‌شود و به UID حساب شما قفل می‌گردد
+                  </span>
+                </div>
+                {customKeyVerifiedInfo?.valid && (
                   <button
                     type="button"
+                    disabled={isTestingByok}
                     onClick={handleClearCustomByokKey}
-                    className="inline-flex items-center gap-1 text-[11px] text-rose-400 hover:text-rose-300 cursor-pointer"
+                    className="inline-flex items-center gap-1 text-[11px] text-rose-400 hover:text-rose-300 cursor-pointer shrink-0"
                   >
                     <Trash2 className="w-3 h-3" />
-                    <span>حذف کلید ذخیره‌شده</span>
+                    <span>حذف کلید از سرور ({customKeyVerifiedInfo.maskedKey})</span>
                   </button>
                 )}
               </div>
@@ -2705,19 +2784,22 @@ export default function App() {
                 value={byokDraftInput}
                 onChange={(e) => {
                   setByokDraftInput(e.target.value);
-                  setByokDraftVerifiedInfo(null);
                   setByokVerifyError(null);
                 }}
-                placeholder="AIzaSy..."
+                placeholder={
+                  customKeyVerifiedInfo?.maskedKey
+                    ? `کلید فعلی در سرور: ${customKeyVerifiedInfo.maskedKey} (برای چرخش کلید جدید وارد کنید)`
+                    : 'AIzaSy...'
+                }
                 className="w-full bg-[#0F1420] border border-slate-700 focus:border-[#08cdbd] rounded-xl px-3 py-2.5 text-xs font-mono text-white outline-none text-left"
               />
 
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  disabled={isTestingByok}
+                  disabled={isTestingByok || !byokDraftInput.trim()}
                   onClick={handleTestCustomByokKey}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-60 text-white text-xs font-black cursor-pointer"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white text-xs font-black cursor-pointer"
                 >
                   {isTestingByok ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -2727,18 +2809,22 @@ export default function App() {
                   <span>
                     {isTestingByok
                       ? 'در حال استعلام از Gemini...'
-                      : 'تست و اعتبارسنجی کلید'}
+                      : '۱. تست زنده کلید'}
                   </span>
                 </button>
 
                 <button
                   type="button"
-                  disabled={!byokDraftVerifiedInfo?.valid}
+                  disabled={isTestingByok || !byokDraftInput.trim() || !currentUser}
                   onClick={handleSaveVerifiedByokKey}
                   className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#08cdbd] hover:bg-[#14dac3] disabled:opacity-40 text-[#062959] text-xs font-black cursor-pointer"
                 >
                   <CheckCircle2 className="w-4 h-4" />
-                  <span>ذخیره و فعال‌سازی کلید</span>
+                  <span>
+                    {customKeyVerifiedInfo?.valid
+                      ? '۲. چرخش و جایگزینی کلید در سرور'
+                      : '۲. رمزنگاری و ذخیره در سرور'}
+                  </span>
                 </button>
               </div>
 

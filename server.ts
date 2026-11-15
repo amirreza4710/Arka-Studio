@@ -8,8 +8,11 @@ import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import {
   ARKA_SYSTEM_INSTRUCTION,
+  ClassifiedAiError,
+  GEMINI_MODEL_CAPABILITY_REGISTRY,
   GeminiRouterModelId,
   resolveSmartModelForTask,
+  validateModelCapabilityForTask,
 } from './src/config/arkaCore';
 
 dotenv.config();
@@ -27,9 +30,27 @@ try {
   firebaseWebApiKey = '';
 }
 
-interface VerifiedFirebaseUser {
+export interface VerifiedFirebaseUser {
   uid: string;
   email?: string;
+  emailVerified?: boolean;
+}
+
+const ADMIN_OWNER_EMAIL = String(
+  process.env.ARKA_ADMIN_EMAIL || 'amirrezaahmadynezhad@gmail.com'
+)
+  .trim()
+  .toLowerCase();
+
+export function isVerifiedAdminUser(
+  user: VerifiedFirebaseUser | null | undefined
+): boolean {
+  if (!user) return false;
+  if (user.emailVerified === false) return false;
+  if (process.env.ALLOW_ALL_AUTHENTICATED_SERVER_KEY === 'true') return true;
+  return Boolean(
+    user.email && user.email.trim().toLowerCase() === ADMIN_OWNER_EMAIL
+  );
 }
 
 function extractBearerToken(req: express.Request): string {
@@ -40,11 +61,30 @@ function extractBearerToken(req: express.Request): string {
   return authHeader.slice(7).trim();
 }
 
-async function verifyFirebaseIdToken(
+// Optional test-mode token verifier hook for automated security verification tests
+let customTokenVerifierForTests:
+  | ((token: string) => Promise<VerifiedFirebaseUser | null>)
+  | null = null;
+
+export function setTokenVerifierForTests(
+  fn: ((token: string) => Promise<VerifiedFirebaseUser | null>) | null
+) {
+  customTokenVerifierForTests = fn;
+}
+
+export async function verifyFirebaseIdToken(
   idToken: string
 ): Promise<VerifiedFirebaseUser | null> {
   const token = String(idToken || '').trim();
-  if (!token || token.length > 8192 || !firebaseWebApiKey) {
+  if (!token || token.length > 8192) {
+    return null;
+  }
+
+  if (customTokenVerifierForTests) {
+    return customTokenVerifierForTests(token);
+  }
+
+  if (!firebaseWebApiKey) {
     return null;
   }
 
@@ -69,7 +109,7 @@ async function verifyFirebaseIdToken(
     }
 
     const data = (await resp.json()) as {
-      users?: Array<{ localId?: string; email?: string }>;
+      users?: Array<{ localId?: string; email?: string; emailVerified?: boolean }>;
     };
     const user = Array.isArray(data?.users) ? data.users[0] : null;
     if (!user?.localId) {
@@ -79,19 +119,223 @@ async function verifyFirebaseIdToken(
     return {
       uid: String(user.localId),
       email: user.email ? String(user.email) : undefined,
+      emailVerified:
+        typeof user.emailVerified === 'boolean' ? user.emailVerified : true,
     };
   } catch {
     return null;
   }
 }
 
-// Simple In-Memory Rate Limiter (keyed by userId if authenticated, else IP)
+// ============================================================================
+// SERVER-SIDE AES-256-GCM ENCRYPTED BYOK VAULT (MULTI-USER ISOLATED BY UID)
+// ============================================================================
+
+interface EncryptedVaultRecord {
+  uid: string;
+  ivHex: string;
+  authTagHex: string;
+  ciphertextHex: string;
+  maskedKey: string;
+  provider: 'gemini';
+  models: string[];
+  hasPro: boolean;
+  hasFlash: boolean;
+  updatedAt: string;
+}
+
+const VAULT_DIR = path.join(__dirname, '.data');
+const VAULT_FILE_PATH = path.join(VAULT_DIR, 'byok-vault.enc.json');
+const byokVaultStore = new Map<string, EncryptedVaultRecord>();
+
+function deriveUserVaultKey(uid: string): Buffer {
+  const masterSecret =
+    process.env.BYOK_VAULT_SECRET ||
+    process.env.GEMINI_API_KEY ||
+    firebaseWebApiKey ||
+    'arka-enterprise-studio-vault-secret-v1';
+  return crypto.pbkdf2Sync(
+    masterSecret,
+    `arka-uid-salt:${uid}`,
+    10000,
+    32,
+    'sha256'
+  );
+}
+
+export function maskApiKey(rawKey: string): string {
+  const clean = String(rawKey || '').trim();
+  if (clean.length <= 8) return '••••••••';
+  return `${clean.slice(0, 4)}••••••••${clean.slice(-4)}`;
+}
+
+function loadEncryptedVaultFromDisk(): void {
+  try {
+    if (!fs.existsSync(VAULT_FILE_PATH)) return;
+    const raw = fs.readFileSync(VAULT_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      for (const rec of parsed) {
+        if (
+          rec &&
+          typeof rec.uid === 'string' &&
+          typeof rec.ciphertextHex === 'string' &&
+          typeof rec.ivHex === 'string' &&
+          typeof rec.authTagHex === 'string'
+        ) {
+          byokVaultStore.set(rec.uid, rec);
+        }
+      }
+    }
+  } catch {
+    // Ignore corrupt or missing vault file
+  }
+}
+
+function persistEncryptedVaultToDisk(): void {
+  try {
+    if (!fs.existsSync(VAULT_DIR)) {
+      fs.mkdirSync(VAULT_DIR, { recursive: true, mode: 0o700 });
+    }
+    const serialized = JSON.stringify(
+      Array.from(byokVaultStore.values()),
+      null,
+      2
+    );
+    fs.writeFileSync(VAULT_FILE_PATH, serialized, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+  } catch {
+    // Ignore disk write issues in read-only environments; in-memory map remains active
+  }
+}
+
+loadEncryptedVaultFromDisk();
+
+export function storeEncryptedUserApiKey(params: {
+  uid: string;
+  rawApiKey: string;
+  models: string[];
+  hasPro: boolean;
+  hasFlash: boolean;
+}): Omit<EncryptedVaultRecord, 'ivHex' | 'authTagHex' | 'ciphertextHex'> {
+  const uid = String(params.uid || '').trim();
+  const cleanKey = String(params.rawApiKey || '').trim();
+  if (!uid || !cleanKey) {
+    throw new Error('شناسه کاربر و کلید API برای رمزنگاری الزامی است.');
+  }
+
+  const keyBuf = deriveUserVaultKey(uid);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', keyBuf, iv);
+  // Bind UID as Additional Authenticated Data (AAD) so ciphertext cannot be transplanted across users
+  cipher.setAAD(Buffer.from(`arka-uid:${uid}`, 'utf8'));
+
+  const encrypted = Buffer.concat([
+    cipher.update(cleanKey, 'utf8'),
+    cipher.final(),
+  ]);
+  const authTag = cipher.getAuthTag();
+
+  const updatedAt = new Intl.DateTimeFormat('fa-IR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date());
+
+  const record: EncryptedVaultRecord = {
+    uid,
+    ivHex: iv.toString('hex'),
+    authTagHex: authTag.toString('hex'),
+    ciphertextHex: encrypted.toString('hex'),
+    maskedKey: maskApiKey(cleanKey),
+    provider: 'gemini',
+    models: params.models,
+    hasPro: params.hasPro,
+    hasFlash: params.hasFlash,
+    updatedAt,
+  };
+
+  byokVaultStore.set(uid, record);
+  persistEncryptedVaultToDisk();
+
+  return {
+    uid: record.uid,
+    maskedKey: record.maskedKey,
+    provider: record.provider,
+    models: record.models,
+    hasPro: record.hasPro,
+    hasFlash: record.hasFlash,
+    updatedAt: record.updatedAt,
+  };
+}
+
+export function decryptUserApiKeyForUid(uid: string): string | null {
+  const cleanUid = String(uid || '').trim();
+  if (!cleanUid) return null;
+  const record = byokVaultStore.get(cleanUid);
+  if (!record || record.uid !== cleanUid) return null;
+
+  try {
+    const keyBuf = deriveUserVaultKey(cleanUid);
+    const iv = Buffer.from(record.ivHex, 'hex');
+    const authTag = Buffer.from(record.authTagHex, 'hex');
+    const ciphertext = Buffer.from(record.ciphertextHex, 'hex');
+
+    const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuf, iv);
+    decipher.setAAD(Buffer.from(`arka-uid:${cleanUid}`, 'utf8'));
+    decipher.setAuthTag(authTag);
+
+    const decrypted = Buffer.concat([
+      decipher.update(ciphertext),
+      decipher.final(),
+    ]);
+    return decrypted.toString('utf8');
+  } catch {
+    return null;
+  }
+}
+
+export function getUserVaultMetadata(uid: string): Omit<
+  EncryptedVaultRecord,
+  'ivHex' | 'authTagHex' | 'ciphertextHex'
+> | null {
+  const cleanUid = String(uid || '').trim();
+  if (!cleanUid) return null;
+  const rec = byokVaultStore.get(cleanUid);
+  if (!rec || rec.uid !== cleanUid) return null;
+  return {
+    uid: rec.uid,
+    maskedKey: rec.maskedKey,
+    provider: rec.provider,
+    models: rec.models,
+    hasPro: rec.hasPro,
+    hasFlash: rec.hasFlash,
+    updatedAt: rec.updatedAt,
+  };
+}
+
+export function deleteUserApiKeyFromVault(uid: string): boolean {
+  const cleanUid = String(uid || '').trim();
+  if (!cleanUid) return false;
+  const existed = byokVaultStore.delete(cleanUid);
+  if (existed) {
+    persistEncryptedVaultToDisk();
+  }
+  return existed;
+}
+
+// ============================================================================
+// SLIDING-WINDOW IN-MEMORY RATE LIMITER
+// ============================================================================
+
 interface RateLimitBucket {
   count: number;
   resetAt: number;
 }
 
-const rateLimitStore = new Map<string, RateLimitBucket>();
+export const rateLimitStore = new Map<string, RateLimitBucket>();
 
 const rateLimitCleanupTimer = setInterval(() => {
   const now = Date.now();
@@ -114,7 +358,7 @@ function getClientIp(req: express.Request): string {
   return String(req.ip || req.socket?.remoteAddress || 'unknown');
 }
 
-function checkRateLimit(params: {
+export function checkRateLimit(params: {
   endpoint: string;
   userId?: string | null;
   ip: string;
@@ -171,6 +415,7 @@ function checkRateLimit(params: {
 
 const MAX_PROMPT_LENGTH = 4000;
 const MAX_TEXT_FIELD_LENGTH = 4000;
+const MAX_BRAND_SUMMARY_LENGTH = 8000;
 const MAX_SHORT_FIELD_LENGTH = 120;
 const MAX_API_KEY_LENGTH = 512;
 
@@ -189,20 +434,24 @@ function validateTextFields(
   return null;
 }
 
-function createGeminiClient(customApiKey?: string): {
+function createGeminiClientFromKey(
+  rawApiKey: string,
+  source: 'vault-byok' | 'custom-byok' | 'server-env'
+): {
   ai: GoogleGenAI;
-  keySource: 'custom-byok' | 'server-env';
+  keySource: 'vault-byok' | 'custom-byok' | 'server-env';
   fingerprint: string;
 } {
-  const trimmedCustom = String(customApiKey || '').trim();
-  const apiKey = trimmedCustom || process.env.GEMINI_API_KEY || '';
+  const apiKey = String(rawApiKey || '').trim();
   if (!apiKey) {
-    throw new Error(
-      'کلید GEMINI_API_KEY در محیط سرور یافت نشد و کلید شخصی نیز ثبت نشده است. لطفاً کلید شخصی خود را از دکمه «مدیریت اعتبار و API Key» وارد و تایید کنید.'
-    );
+    throw new Error('کلید API معتبر یافت نشد.');
   }
-  const digest = crypto.createHash('sha256').update(apiKey).digest('hex').slice(0, 16);
-  const fingerprint = `${trimmedCustom ? 'byok' : 'env'}:${digest}`;
+  const digest = crypto
+    .createHash('sha256')
+    .update(apiKey)
+    .digest('hex')
+    .slice(0, 16);
+  const fingerprint = `${source}:${digest}`;
   const ai = new GoogleGenAI({
     apiKey,
     httpOptions: {
@@ -213,8 +462,220 @@ function createGeminiClient(customApiKey?: string): {
   });
   return {
     ai,
-    keySource: trimmedCustom ? 'custom-byok' : 'server-env',
+    keySource: source,
     fingerprint,
+  };
+}
+
+function resolveAuthorizedGeminiClient(params: {
+  verifiedUser: VerifiedFirebaseUser | null;
+  inlineCustomApiKey?: string;
+  requestedConnectionMode?: string;
+}):
+  | {
+      ok: true;
+      ai: GoogleGenAI;
+      keySource: 'vault-byok' | 'custom-byok' | 'server-env';
+      fingerprint: string;
+    }
+  | {
+      ok: false;
+      classifiedError: ClassifiedAiError;
+    } {
+  const inlineKey = String(params.inlineCustomApiKey || '').trim();
+
+  // 1. If the user is authenticated and has a stored encrypted key in their BYOK vault
+  if (params.verifiedUser) {
+    const vaultKey = decryptUserApiKeyForUid(params.verifiedUser.uid);
+    const isAdmin = isVerifiedAdminUser(params.verifiedUser);
+
+    if (
+      vaultKey &&
+      (params.requestedConnectionMode === 'custom-byok' || !isAdmin)
+    ) {
+      const client = createGeminiClientFromKey(vaultKey, 'vault-byok');
+      return { ok: true, ...client };
+    }
+
+    if (inlineKey) {
+      const client = createGeminiClientFromKey(inlineKey, 'custom-byok');
+      return { ok: true, ...client };
+    }
+
+    // Admin fallback to server GEMINI_API_KEY
+    if (isAdmin && process.env.GEMINI_API_KEY) {
+      const client = createGeminiClientFromKey(
+        process.env.GEMINI_API_KEY,
+        'server-env'
+      );
+      return { ok: true, ...client };
+    }
+
+    // If admin has a vault key even when mode wasn't custom-byok, use vault key if server key is absent
+    if (vaultKey) {
+      const client = createGeminiClientFromKey(vaultKey, 'vault-byok');
+      return { ok: true, ...client };
+    }
+
+    return {
+      ok: false,
+      classifiedError: {
+        errorCode: 'BYOK_KEY_REQUIRED',
+        httpStatus: 403,
+        messageFa:
+          'کلید شخصی Gemini در گاوصندوق امن حساب شما ثبت نشده است. طبق سیاست امنیتی چندکاربره آرکا، استفاده از سهمیه سرور صرفاً برای ادمین سازمان مجاز است؛ لطفاً از دکمه «مدیریت اعتبار و API Key» کلید شخصی خود را ثبت و رمزنگاری کنید.',
+        retryable: false,
+        canFallbackToFlash: false,
+        suggestedFallbackModel: null,
+      },
+    };
+  }
+
+  // 2. Unauthenticated request: only allowed if inline customApiKey is explicitly provided
+  if (inlineKey) {
+    const client = createGeminiClientFromKey(inlineKey, 'custom-byok');
+    return { ok: true, ...client };
+  }
+
+  return {
+    ok: false,
+    classifiedError: {
+      errorCode: 'AUTH_REQUIRED',
+      httpStatus: 401,
+      messageFa:
+        'احراز هویت انجام نشد. لطفاً ابتدا وارد حساب گوگل خود شوید و کلید شخصی خود را در گاوصندوق امن سرور ثبت کنید.',
+      retryable: false,
+      canFallbackToFlash: false,
+      suggestedFallbackModel: null,
+    },
+  };
+}
+
+// ============================================================================
+// STRUCTURED PERSIAN ERROR CLASSIFIER FOR GEMINI API
+// ============================================================================
+
+export function classifyGeminiError(
+  err: any,
+  attemptedModel?: GeminiRouterModelId
+): ClassifiedAiError {
+  const rawMsg = String(err?.message || err || '').trim();
+  const lower = rawMsg.toLowerCase();
+  const status = Number(err?.status || err?.code || 0);
+
+  if (
+    status === 401 ||
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
+    lower.includes('invalid api key')
+  ) {
+    return {
+      errorCode: 'INVALID_API_KEY',
+      httpStatus: 401,
+      messageFa:
+        'کلید API Gemini نامعتبر یا منقضی است. لطفاً در بخش «مدیریت اعتبار و API Key» کلید خود را بررسی یا جایگزین کنید.',
+      technicalReason: 'INVALID_API_KEY',
+      retryable: false,
+      canFallbackToFlash: false,
+      suggestedFallbackModel: null,
+      attemptedModel,
+    };
+  }
+
+  if (
+    status === 403 ||
+    lower.includes('permission_denied') ||
+    lower.includes('forbidden')
+  ) {
+    return {
+      errorCode: 'PERMISSION_DENIED',
+      httpStatus: 403,
+      messageFa:
+        'دسترسی این کلید API به مدل یا سرویس درخواستی مسدود است (Permission Denied). تنظیمات پروژه Google AI Studio خود را بررسی کنید.',
+      technicalReason: 'PERMISSION_DENIED',
+      retryable: false,
+      canFallbackToFlash: attemptedModel === 'gemini-2.5-pro',
+      suggestedFallbackModel:
+        attemptedModel === 'gemini-2.5-pro' ? 'gemini-2.5-flash' : null,
+      attemptedModel,
+    };
+  }
+
+  if (
+    status === 429 ||
+    lower.includes('quota') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('rate limit') ||
+    lower.includes('too many requests')
+  ) {
+    const canFallback = attemptedModel === 'gemini-2.5-pro';
+    return {
+      errorCode: 'QUOTA_EXCEEDED',
+      httpStatus: 429,
+      messageFa: canFallback
+        ? 'سهمیه (Quota 429) مدل تحلیلی Gemini 2.5 Pro روی این کلید به پایان رسیده است. برای جلوگیری از افت ناخواسته کیفیت، مدل به صورت پنهان تغییر نکرد؛ می‌توانید با کلیک روی دکمه زیر، همین درخواست را با مدل جایگزین (Gemini 2.5 Flash) اجرا کنید.'
+        : 'محدودیت سهمیه یا تعداد درخواست (Quota 429) روی کلید فعال رخ داده است. لطفاً چند لحظه صبر کنید یا کلید دیگری جایگزین نمایید.',
+      technicalReason: 'RESOURCE_EXHAUSTED_429',
+      retryable: true,
+      canFallbackToFlash: canFallback,
+      suggestedFallbackModel: canFallback ? 'gemini-2.5-flash' : null,
+      attemptedModel,
+    };
+  }
+
+  if (
+    status === 404 ||
+    status === 503 ||
+    lower.includes('not found') ||
+    lower.includes('overloaded') ||
+    lower.includes('unavailable')
+  ) {
+    const canFallback = attemptedModel === 'gemini-2.5-pro';
+    return {
+      errorCode: 'MODEL_UNAVAILABLE',
+      httpStatus: status === 404 ? 404 : 503,
+      messageFa: canFallback
+        ? `مدل «${attemptedModel}» در حال حاضر شلوغ یا خارج از دسترس است. در صورت تمایل روی دکمه «تلاش مجدد با مدل جایگزین (Gemini 2.5 Flash)» کلیک کنید.`
+        : `مدل «${attemptedModel || 'Gemini'}» موقتاً در دسترس نیست. لطفاً چند ثانیه دیگر تلاش کنید.`,
+      technicalReason: 'MODEL_UNAVAILABLE',
+      retryable: true,
+      canFallbackToFlash: canFallback,
+      suggestedFallbackModel: canFallback ? 'gemini-2.5-flash' : null,
+      attemptedModel,
+    };
+  }
+
+  if (
+    status === 504 ||
+    lower.includes('timeout') ||
+    lower.includes('aborted') ||
+    lower.includes('etimedout')
+  ) {
+    return {
+      errorCode: 'NETWORK_TIMEOUT',
+      httpStatus: 504,
+      messageFa:
+        'زمان انتظار پاسخ از سرور هوش مصنوعی به پایان رسید (Timeout). لطفاً دوباره تلاش کنید یا از مدل پرشتاب‌تر استفاده نمایید.',
+      technicalReason: 'NETWORK_TIMEOUT',
+      retryable: true,
+      canFallbackToFlash: attemptedModel === 'gemini-2.5-pro',
+      suggestedFallbackModel:
+        attemptedModel === 'gemini-2.5-pro' ? 'gemini-2.5-flash' : null,
+      attemptedModel,
+    };
+  }
+
+  return {
+    errorCode: 'UPSTREAM_ERROR',
+    httpStatus: 500,
+    messageFa:
+      'خطا در پردازش درخواست توسط سرویس هوش مصنوعی. لطفاً وضعیت اتصال یا پرامپت ورودی را بررسی و مجدداً تلاش کنید.',
+    technicalReason: 'UPSTREAM_ERROR',
+    retryable: true,
+    canFallbackToFlash: attemptedModel === 'gemini-2.5-pro',
+    suggestedFallbackModel:
+      attemptedModel === 'gemini-2.5-pro' ? 'gemini-2.5-flash' : null,
+    attemptedModel,
   };
 }
 
@@ -249,7 +710,6 @@ const ARKA_BASE_KNOWLEDGE = `
 - مطالعه موردی واقعی در سایت: «شرکت رنگ بهارستان» (تبدیل پراکندگی اطلاعات فروش و انبار به شفافیت ۱۰۰٪ و گزارش‌گیری لحظه‌ای).
 `;
 
-// 6-Hour In-Memory Cache for live arka-acc.ir context
 const LIVE_CONTEXT_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 let cachedLiveSiteSummary = '';
 let lastFetchedAt = 0;
@@ -302,10 +762,9 @@ async function getLiveArkaSiteContext(forceRefresh = false): Promise<{
       };
     }
   } catch {
-    // Fallback immediately to static 8-system Arka catalog so AI is never blocked
+    // Fallback immediately to static 8-system Arka catalog
   }
 
-  // Also cache static fallback timestamp if no cache exists yet
   if (!cachedLiveSiteSummary) {
     cachedLiveSiteSummary = ARKA_BASE_KNOWLEDGE;
     lastFetchedAt = now;
@@ -320,7 +779,6 @@ async function getLiveArkaSiteContext(forceRefresh = false): Promise<{
   };
 }
 
-// Short 5-minute cache for ai.models.list() per key fingerprint
 const modelListCache = new Map<
   string,
   { models: string[]; checkedAt: number }
@@ -367,10 +825,16 @@ function isQuotaOrAvailabilityError(err: any): boolean {
   );
 }
 
-async function generateContentWithSmartFallback(params: {
+/**
+ * Executes Gemini generation with explicit fallback control.
+ * - By default (`allowModelFallback === false`), it will NOT silently downgrade from Pro to Flash on 429/quota errors.
+ * - When the user explicitly clicks "تلاش مجدد با مدل جایگزین" (`allowModelFallback === true`), it executes on the fallback model.
+ */
+async function executeGeminiGeneration(params: {
   ai: GoogleGenAI;
   primaryModel: GeminiRouterModelId;
   fallbackModel: GeminiRouterModelId;
+  allowModelFallback: boolean;
   contents: string;
   config: Record<string, any>;
 }): Promise<{
@@ -379,6 +843,24 @@ async function generateContentWithSmartFallback(params: {
   usedFallback: boolean;
   fallbackReason?: string;
 }> {
+  if (
+    params.allowModelFallback &&
+    params.primaryModel !== params.fallbackModel
+  ) {
+    const response = await params.ai.models.generateContent({
+      model: params.fallbackModel,
+      contents: params.contents,
+      config: params.config,
+    });
+    return {
+      response,
+      actualModelUsed: params.fallbackModel,
+      usedFallback: true,
+      fallbackReason:
+        'انتخاب آگاهانه کاربر ← اجرای مجدد درخواست با مدل جایگزین gemini-2.5-flash',
+    };
+  }
+
   try {
     const response = await params.ai.models.generateContent({
       model: params.primaryModel,
@@ -392,6 +874,7 @@ async function generateContentWithSmartFallback(params: {
     };
   } catch (err: any) {
     if (
+      params.allowModelFallback &&
       params.primaryModel !== params.fallbackModel &&
       isQuotaOrAvailabilityError(err)
     ) {
@@ -405,7 +888,7 @@ async function generateContentWithSmartFallback(params: {
         actualModelUsed: params.fallbackModel,
         usedFallback: true,
         fallbackReason:
-          'محدودیت سهمیه یا در دسترس نبودن موقت مدل Pro ← سوئیچ خودکار به gemini-2.5-flash',
+          'تلاش مجدد با تایید کاربر ← سوئیچ به مدل جایگزین gemini-2.5-flash',
       };
     }
     throw err;
@@ -471,10 +954,141 @@ const SLIDE_SCHEMA = {
   ],
 };
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
+const SEO_ARTICLE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    articleTitleH1: {
+      type: Type.STRING,
+      description: 'عنوان اصلی مقاله (H1) جذاب و بهینه‌شده برای سئو و کلیک',
+    },
+    metaTitle: {
+      type: Type.STRING,
+      description: 'عنوان متا سئو (حداکثر ۶۰ کاراکتر)',
+    },
+    metaDescription: {
+      type: Type.STRING,
+      description: 'توضیحات متا سئو (۱۴۰ تا ۱۶۰ کاراکتر) با دعوت به اقدام',
+    },
+    suggestedSlug: {
+      type: Type.STRING,
+      description: 'نامک (URL Slug) انگلیسی پیشنهادی برای سایت arka-acc.ir',
+    },
+    primaryKeyword: {
+      type: Type.STRING,
+      description: 'کلمه کلیدی کانونی مقاله',
+    },
+    secondaryKeywords: {
+      type: Type.ARRAY,
+      description: '۵ تا ۸ کلمه کلیدی فرعی، هم‌خانواده (LSI) و عبارات طولانی',
+      items: { type: Type.STRING },
+    },
+    searchIntent: {
+      type: Type.STRING,
+      description: 'Informational | Commercial | Transactional | Navigational',
+    },
+    searchIntentAnalysisFa: {
+      type: Type.STRING,
+      description: 'تحلیل دقیق نیت جستجوی کاربر و زاویه ورود به معرفی راهکار آرکا',
+    },
+    aeoDirectAnswerBox: {
+      type: Type.STRING,
+      description:
+        'پاسخ مستقیم، فشرده و ۴۰ تا ۶۰ کلمه‌ای برای باکس Featured Snippet گوگل و موتورهای پاسخ‌گو (AEO)',
+    },
+    geoCitationSummary: {
+      type: Type.STRING,
+      description:
+        'فکت‌شیت و خلاصه استنادی غنی از داده برای دیده‌شدن برند آرکا در موتورهای مولد هوش مصنوعی (GEO مانند ChatGPT/Perplexity/Google AI)',
+    },
+    estimatedReadingMinutes: {
+      type: Type.INTEGER,
+      description: 'زمان تخمینی مطالعه به دقیقه',
+    },
+    sections: {
+      type: Type.ARRAY,
+      description: 'بخش‌های ساختاریافته مقاله (حداقل ۵ بخش H2/H3 با محتوای کامل و تخصصی)',
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          headingLevel: { type: Type.STRING, description: 'H2 یا H3' },
+          headingTitle: { type: Type.STRING, description: 'عنوان زیربخش' },
+          bodyParagraphs: {
+            type: Type.ARRAY,
+            description: 'پاراگراف‌های کامل، کاربردی و عمیق این بخش',
+            items: { type: Type.STRING },
+          },
+          keyTakeaway: {
+            type: Type.STRING,
+            description: 'نکته کلیدی یا مزیت عملیاتی مرتبط با نرم‌افزار آرکا',
+          },
+        },
+        required: ['headingLevel', 'headingTitle', 'bodyParagraphs'],
+      },
+    },
+    faqItems: {
+      type: Type.ARRAY,
+      description: '۴ تا ۶ پرسش و پاسخ متداول برای اسکیمای FAQPage',
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          question: { type: Type.STRING },
+          answer: { type: Type.STRING },
+        },
+        required: ['question', 'answer'],
+      },
+    },
+    internalLinks: {
+      type: Type.ARRAY,
+      description: 'پیشنهادهای لینک‌سازی داخلی به صفحات رسمی سایت arka-acc.ir',
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          anchorText: { type: Type.STRING, description: 'انکرتکست پیشنهادی' },
+          targetUrl: {
+            type: Type.STRING,
+            description: 'لینک هدف در سایت arka-acc.ir (مثلاً https://arka-acc.ir/demo)',
+          },
+          placementContext: {
+            type: Type.STRING,
+            description: 'محل و دلیل درج این لینک در متن مقاله',
+          },
+        },
+        required: ['anchorText', 'targetUrl', 'placementContext'],
+      },
+    },
+    linkedinPostSnippet: {
+      type: Type.STRING,
+      description: 'پست تخصصی لینکدین استخراج‌شده از این مقاله برای مدیران مالی و کسب‌وکار',
+    },
+    instagramCaptionSnippet: {
+      type: Type.STRING,
+      description: 'کپشن اینستاگرام استخراج‌شده از مقاله به همراه هشتگ‌ها',
+    },
+    heroSlide: SLIDE_SCHEMA,
+  },
+  required: [
+    'articleTitleH1',
+    'metaTitle',
+    'metaDescription',
+    'suggestedSlug',
+    'primaryKeyword',
+    'secondaryKeywords',
+    'searchIntent',
+    'searchIntentAnalysisFa',
+    'aeoDirectAnswerBox',
+    'geoCitationSummary',
+    'estimatedReadingMinutes',
+    'sections',
+    'faqItems',
+    'internalLinks',
+    'linkedinPostSnippet',
+    'instagramCaptionSnippet',
+    'heroSlide',
+  ],
+};
 
+export function createArkaExpressApp() {
+  const app = express();
   app.use(express.json({ limit: '2mb' }));
 
   // 1. Live Arka Website Sync Endpoint with 6-Hour In-Memory Cache & Force Refresh
@@ -500,7 +1114,204 @@ async function startServer() {
     }
   });
 
-  // 2. Live API Key Verification Endpoint (POST /api/arka-ai/verify-key)
+  // 2. Encrypted BYOK Vault Status Endpoint (GET /api/arka-ai/key-status)
+  // Never returns plaintext or ciphertext; returns only masked metadata for the authenticated user
+  app.get('/api/arka-ai/key-status', async (req, res) => {
+    try {
+      const bearerToken = extractBearerToken(req);
+      const verifiedUser = bearerToken
+        ? await verifyFirebaseIdToken(bearerToken)
+        : null;
+
+      const hasServerKey = Boolean(process.env.GEMINI_API_KEY);
+      if (!verifiedUser) {
+        return res.json({
+          ok: true,
+          authenticated: false,
+          configured: false,
+          maskedKey: null,
+          provider: 'gemini',
+          models: [],
+          hasPro: false,
+          hasFlash: false,
+          updatedAt: null,
+          isAdminFallbackAllowed: false,
+          serverKeyConfigured: hasServerKey,
+        });
+      }
+
+      const meta = getUserVaultMetadata(verifiedUser.uid);
+      const isAdmin = isVerifiedAdminUser(verifiedUser);
+
+      return res.json({
+        ok: true,
+        authenticated: true,
+        configured: Boolean(meta),
+        maskedKey: meta?.maskedKey || null,
+        provider: 'gemini',
+        models: meta?.models || [],
+        hasPro: Boolean(meta?.hasPro),
+        hasFlash: Boolean(meta?.hasFlash),
+        updatedAt: meta?.updatedAt || null,
+        isAdminFallbackAllowed: isAdmin && hasServerKey,
+        serverKeyConfigured: hasServerKey,
+      });
+    } catch {
+      return res.status(500).json({
+        ok: false,
+        error: 'خطا در بررسی وضعیت گاوصندوق کلید کاربر.',
+      });
+    }
+  });
+
+  // 3. Save / Rotate User Personal Key in Encrypted BYOK Vault (POST /api/arka-ai/key)
+  app.post('/api/arka-ai/key', async (req, res) => {
+    const startedAt = Date.now();
+    try {
+      const bearerToken = extractBearerToken(req);
+      const verifiedUser = bearerToken
+        ? await verifyFirebaseIdToken(bearerToken)
+        : null;
+
+      if (!verifiedUser) {
+        return res.status(401).json({
+          ok: false,
+          valid: false,
+          error:
+            'برای ثبت و رمزنگاری کلید شخصی در گاوصندوق سرور، ابتدا باید وارد حساب گوگل خود شوید.',
+          errorDetails: {
+            errorCode: 'AUTH_REQUIRED',
+            httpStatus: 401,
+            messageFa:
+              'برای ثبت و رمزنگاری کلید شخصی در گاوصندوق سرور، ابتدا باید وارد حساب گوگل خود شوید.',
+            retryable: false,
+            canFallbackToFlash: false,
+            suggestedFallbackModel: null,
+          },
+        });
+      }
+
+      const rateCheck = checkRateLimit({
+        endpoint: 'vault-key-write',
+        userId: verifiedUser.uid,
+        ip: getClientIp(req),
+        limit: 5,
+        windowMs: 60 * 1000,
+      });
+      if (!rateCheck.allowed) {
+        res.setHeader('Retry-After', String(rateCheck.retryAfterSeconds));
+        return res.status(429).json({
+          ok: false,
+          valid: false,
+          error: `تعداد درخواست‌های ثبت کلید بیش از حد مجاز (۵ بار در دقیقه) است. لطفاً ${rateCheck.retryAfterSeconds} ثانیه صبر کنید.`,
+          retryAfterSeconds: rateCheck.retryAfterSeconds,
+        });
+      }
+
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const fieldError = validateTextFields([
+        { labelFa: 'کلید API شخصی', value: body.customApiKey, maxLength: MAX_API_KEY_LENGTH },
+        { labelFa: 'سرویس‌دهنده', value: body.provider, maxLength: 50 },
+      ]);
+      if (fieldError) {
+        return res.status(400).json({ ok: false, valid: false, error: fieldError });
+      }
+
+      const trimmedKey = String(body.customApiKey || '').trim();
+      if (!trimmedKey || trimmedKey.length < 15) {
+        return res.status(400).json({
+          ok: false,
+          valid: false,
+          error: 'لطفاً یک کلید معتبر Google Gemini API Key وارد کنید.',
+        });
+      }
+
+      let models: string[] = [];
+      if (
+        process.env.ARKA_TEST_ALLOW_SYNTHETIC_KEYS === '1' &&
+        trimmedKey.startsWith('AIzaSyTestValidKey_')
+      ) {
+        models = ['gemini-2.5-flash', 'gemini-2.5-pro'];
+      } else {
+        const { ai, fingerprint } = createGeminiClientFromKey(
+          trimmedKey,
+          'custom-byok'
+        );
+        models = await listAvailableGeminiModels(ai, fingerprint, true);
+      }
+
+      if (models.length === 0) {
+        return res.status(401).json({
+          ok: false,
+          valid: false,
+          error: 'هیچ مدل فعالی روی این کلید یافت نشد. صحت کلید را بررسی کنید.',
+        });
+      }
+
+      const hasPro = models.some((m) => m.includes('2.5-pro'));
+      const hasFlash = models.some((m) => m.includes('2.5-flash'));
+
+      const savedMeta = storeEncryptedUserApiKey({
+        uid: verifiedUser.uid,
+        rawApiKey: trimmedKey,
+        models,
+        hasPro,
+        hasFlash,
+      });
+
+      return res.json({
+        ok: true,
+        valid: true,
+        savedToVault: true,
+        maskedKey: savedMeta.maskedKey,
+        provider: 'gemini',
+        models: savedMeta.models,
+        hasPro: savedMeta.hasPro,
+        hasFlash: savedMeta.hasFlash,
+        latencyMs: Date.now() - startedAt,
+        checkedAt: savedMeta.updatedAt,
+      });
+    } catch (err: any) {
+      const classified = classifyGeminiError(err);
+      return res.status(classified.httpStatus).json({
+        ok: false,
+        valid: false,
+        error: classified.messageFa,
+        errorDetails: classified,
+      });
+    }
+  });
+
+  // 4. Delete User Personal Key from Encrypted BYOK Vault (DELETE /api/arka-ai/key)
+  app.delete('/api/arka-ai/key', async (req, res) => {
+    try {
+      const bearerToken = extractBearerToken(req);
+      const verifiedUser = bearerToken
+        ? await verifyFirebaseIdToken(bearerToken)
+        : null;
+
+      if (!verifiedUser) {
+        return res.status(401).json({
+          ok: false,
+          error: 'برای حذف کلید از گاوصندوق سرور، احراز هویت الزامی است.',
+        });
+      }
+
+      const deleted = deleteUserApiKeyFromVault(verifiedUser.uid);
+      return res.json({
+        ok: true,
+        deleted,
+        configured: false,
+      });
+    } catch {
+      return res.status(500).json({
+        ok: false,
+        error: 'خطا در حذف کلید از گاوصندوق سرور.',
+      });
+    }
+  });
+
+  // 5. Live API Key Verification Endpoint (POST /api/arka-ai/verify-key)
   app.post('/api/arka-ai/verify-key', async (req, res) => {
     const startedAt = Date.now();
     try {
@@ -560,8 +1371,19 @@ async function startServer() {
         });
       }
 
-      const { ai, fingerprint } = createGeminiClient(trimmedKey);
-      const models = await listAvailableGeminiModels(ai, fingerprint, true);
+      let models: string[] = [];
+      if (
+        process.env.ARKA_TEST_ALLOW_SYNTHETIC_KEYS === '1' &&
+        trimmedKey.startsWith('AIzaSyTestValidKey_')
+      ) {
+        models = ['gemini-2.5-flash', 'gemini-2.5-pro'];
+      } else {
+        const { ai, fingerprint } = createGeminiClientFromKey(
+          trimmedKey,
+          'custom-byok'
+        );
+        models = await listAvailableGeminiModels(ai, fingerprint, true);
+      }
 
       if (models.length === 0) {
         return res.status(401).json({
@@ -579,6 +1401,7 @@ async function startServer() {
       return res.json({
         ok: true,
         valid: true,
+        maskedKey: maskApiKey(trimmedKey),
         provider: 'gemini',
         models,
         hasPro,
@@ -591,20 +1414,18 @@ async function startServer() {
         }).format(new Date()),
       });
     } catch (err: any) {
-      const status =
-        err?.status === 401 || err?.status === 403 ? err.status : 400;
-      return res.status(status).json({
+      const classified = classifyGeminiError(err);
+      return res.status(classified.httpStatus).json({
         ok: false,
         valid: false,
         provider: 'gemini',
-        error:
-          err?.message ||
-          'کلید API نامعتبر است یا دسترسی به لیست مدل‌های Gemini مسدود شده است.',
+        error: classified.messageFa,
+        errorDetails: classified,
       });
     }
   });
 
-  // 3. Pre-flight AI Connection Diagnostics & Available Real Gemini Models
+  // 6. Pre-flight AI Connection Diagnostics & Capability Registry
   app.get('/api/arka-ai/diagnostics', async (req, res) => {
     try {
       const bearerToken = extractBearerToken(req);
@@ -640,11 +1461,20 @@ async function startServer() {
       const samplePrompt = String(req.query.prompt || '');
       const sampleTab = String(req.query.mode || 'campaign-calendar-30');
       const modelDecision = resolveSmartModelForTask(samplePrompt, sampleTab);
+      const vaultMeta = verifiedUser
+        ? getUserVaultMetadata(verifiedUser.uid)
+        : null;
 
-      let discoveredModels: string[] = ['gemini-2.5-flash', 'gemini-2.5-pro'];
-      if (hasServerKey && verifiedUser) {
+      let discoveredModels: string[] = vaultMeta?.models?.length
+        ? vaultMeta.models
+        : ['gemini-2.5-flash', 'gemini-2.5-pro'];
+
+      if (!vaultMeta && hasServerKey && isVerifiedAdminUser(verifiedUser)) {
         try {
-          const { ai, fingerprint } = createGeminiClient();
+          const { ai, fingerprint } = createGeminiClientFromKey(
+            process.env.GEMINI_API_KEY || '',
+            'server-env'
+          );
           const liveModels = await listAvailableGeminiModels(ai, fingerprint);
           if (liveModels.length > 0) {
             discoveredModels = liveModels;
@@ -657,6 +1487,10 @@ async function startServer() {
       res.json({
         ok: true,
         serverKeyConfigured: hasServerKey,
+        userVaultConfigured: Boolean(vaultMeta),
+        userMaskedKey: vaultMeta?.maskedKey || null,
+        isAdminFallbackAllowed: isVerifiedAdminUser(verifiedUser) && hasServerKey,
+        capabilityRegistry: GEMINI_MODEL_CAPABILITY_REGISTRY,
         availableModels: [
           {
             id: 'gemini-2.5-flash',
@@ -665,8 +1499,16 @@ async function startServer() {
           },
           {
             id: 'gemini-2.5-pro',
-            label: 'Gemini 2.5 Pro (استدلال عمیق، کارگردانی ویدیو، ماتریس بصری و تقویم)',
-            bestFor: ['/rpe', '/visual', '/video', '/copy', 'campaign-calendar-30'],
+            label:
+              'Gemini 2.5 Pro (استدلال عمیق، مقاله SEO/AEO/GEO، کارگردانی ویدیو و تقویم)',
+            bestFor: [
+              '/rpe',
+              '/visual',
+              '/video',
+              '/copy',
+              'campaign-calendar-30',
+              'seo-article',
+            ],
           },
         ],
         discoveredModels,
@@ -681,7 +1523,7 @@ async function startServer() {
     }
   });
 
-  // 4. Live Connection Readiness Verification Endpoint (supports BYOK or Authenticated Server Key)
+  // 7. Live Connection Readiness Verification Endpoint
   app.post('/api/arka-ai/verify-connection', async (req, res) => {
     const startedAt = Date.now();
     try {
@@ -708,16 +1550,6 @@ async function startServer() {
       }
 
       const body = req.body && typeof req.body === 'object' ? req.body : {};
-      const rawCustomKey = typeof body.customApiKey === 'string' ? body.customApiKey.trim() : '';
-      if (!rawCustomKey && !verifiedUser) {
-        return res.status(401).json({
-          ok: false,
-          verified: false,
-          error:
-            'احراز هویت انجام نشد. برای تست اتصال با سهمیه سرور، ابتدا وارد حساب گوگل شوید یا کلید شخصی خود را ثبت کنید.',
-        });
-      }
-
       const fieldError = validateTextFields([
         { labelFa: 'دستور سفارشی', value: body.customPrompt, maxLength: MAX_PROMPT_LENGTH },
         { labelFa: 'تب استودیو', value: body.studioTabMode, maxLength: MAX_SHORT_FIELD_LENGTH },
@@ -733,9 +1565,24 @@ async function startServer() {
         customPrompt = '',
         studioTabMode = 'campaign-calendar-30',
         customApiKey = '',
+        allowModelFallback = false,
       } = body;
 
-      const { ai, keySource, fingerprint } = createGeminiClient(customApiKey);
+      const resolved = resolveAuthorizedGeminiClient({
+        verifiedUser,
+        inlineCustomApiKey: customApiKey,
+        requestedConnectionMode: connectionMode,
+      });
+      if (!resolved.ok) {
+        return res.status(resolved.classifiedError.httpStatus).json({
+          ok: false,
+          verified: false,
+          error: resolved.classifiedError.messageFa,
+          errorDetails: resolved.classifiedError,
+        });
+      }
+
+      const { ai, keySource, fingerprint } = resolved;
       const modelDecision = resolveSmartModelForTask(
         String(customPrompt || ''),
         String(studioTabMode || 'campaign-calendar-30')
@@ -748,21 +1595,14 @@ async function startServer() {
         availableModels = ['gemini-2.5-flash', 'gemini-2.5-pro'];
       }
 
-      let primaryModel: GeminiRouterModelId = modelDecision.modelId;
-      if (
-        primaryModel === 'gemini-2.5-pro' &&
-        availableModels.length > 0 &&
-        !availableModels.some((m) => m.includes('2.5-pro')) &&
-        availableModels.some((m) => m.includes('2.5-flash'))
-      ) {
-        primaryModel = 'gemini-2.5-flash';
-      }
+      const primaryModel: GeminiRouterModelId = modelDecision.modelId;
 
       const { response: pingResponse, actualModelUsed, usedFallback } =
-        await generateContentWithSmartFallback({
+        await executeGeminiGeneration({
           ai,
           primaryModel,
           fallbackModel: 'gemini-2.5-flash',
+          allowModelFallback: Boolean(allowModelFallback),
           contents: 'فقط کلمه «آماده» را برگردان.',
           config: {
             systemInstruction: ARKA_SYSTEM_INSTRUCTION,
@@ -791,19 +1631,20 @@ async function startServer() {
         }).format(new Date()),
       });
     } catch (err: any) {
-      res.status(500).json({
+      const classified = classifyGeminiError(err, 'gemini-2.5-pro');
+      res.status(classified.httpStatus).json({
         ok: false,
         verified: false,
-        error:
-          err?.message ||
-          'اعتبارسنجی اتصال سرویس هوش مصنوعی ناموفق بود. لطفاً کلید API یا اتصال شبکه را بررسی کنید.',
+        error: classified.messageFa,
+        errorDetails: classified,
       });
     }
   });
 
-  // 5. Specialized Arka AI Content, 6-Module Enterprise Core, StoryCanvas & Campaign Generator
+  // 8. Specialized Arka AI Content, SEO/AEO/GEO Article Studio, 6-Module Core, StoryCanvas & Campaign Generator
   app.post('/api/arka-ai/generate', async (req, res) => {
     const startedAt = Date.now();
+    let plannedRouterModel: GeminiRouterModelId = 'gemini-2.5-pro';
     try {
       const bearerToken = extractBearerToken(req);
       const verifiedUser = bearerToken
@@ -823,19 +1664,19 @@ async function startServer() {
           ok: false,
           error: `تعداد درخواست‌های تولید محتوا بیش از حد مجاز (۲۰ درخواست در دقیقه) است. لطفاً ${rateCheck.retryAfterSeconds} ثانیه صبر کنید.`,
           retryAfterSeconds: rateCheck.retryAfterSeconds,
+          errorDetails: {
+            errorCode: 'RATE_LIMITED',
+            httpStatus: 429,
+            messageFa: `تعداد درخواست‌های تولید محتوا بیش از حد مجاز (۲۰ درخواست در دقیقه) است. لطفاً ${rateCheck.retryAfterSeconds} ثانیه صبر کنید.`,
+            retryable: true,
+            canFallbackToFlash: false,
+            suggestedFallbackModel: null,
+            retryAfterSeconds: rateCheck.retryAfterSeconds,
+          },
         });
       }
 
       const body = req.body && typeof req.body === 'object' ? req.body : {};
-      const rawCustomKey = typeof body.customApiKey === 'string' ? body.customApiKey.trim() : '';
-      if (!rawCustomKey && !verifiedUser) {
-        return res.status(401).json({
-          ok: false,
-          error:
-            'احراز هویت انجام نشد. برای استفاده از هوش مصنوعی با سهمیه سرور، وارد حساب گوگل شوید یا کلید شخصی خود را ثبت کنید.',
-        });
-      }
-
       const fieldError = validateTextFields([
         { labelFa: 'دستور یا توضیحات تکمیلی', value: body.customPrompt, maxLength: MAX_PROMPT_LENGTH },
         { labelFa: 'نام محصول', value: body.productName, maxLength: MAX_TEXT_FIELD_LENGTH },
@@ -845,6 +1686,9 @@ async function startServer() {
         { labelFa: 'حالت اجرا', value: body.mode, maxLength: MAX_SHORT_FIELD_LENGTH },
         { labelFa: 'حالت اتصال', value: body.connectionMode, maxLength: MAX_SHORT_FIELD_LENGTH },
         { labelFa: 'کلید API شخصی', value: body.customApiKey, maxLength: MAX_API_KEY_LENGTH },
+        { labelFa: 'کلمات کلیدی مقاله', value: body.articleKeywords, maxLength: MAX_TEXT_FIELD_LENGTH },
+        { labelFa: 'نیت جستجو', value: body.articleSearchIntent, maxLength: MAX_SHORT_FIELD_LENGTH },
+        { labelFa: 'خلاصه هوش برند', value: body.brandContextSummary, maxLength: MAX_BRAND_SUMMARY_LENGTH },
       ]);
       if (fieldError) {
         return res.status(400).json({ ok: false, error: fieldError });
@@ -862,10 +1706,11 @@ async function startServer() {
         injectToCanvas = false,
         customApiKey = '',
         connectionMode = 'studio-creator-core',
+        allowModelFallback = false,
+        articleKeywords = '',
+        articleSearchIntent = 'Commercial',
+        brandContextSummary = '',
       } = body;
-
-      const { ai, keySource, fingerprint } = createGeminiClient(customApiKey);
-      const siteContext = await getLiveArkaSiteContext(false);
 
       const trimmedCustom = String(customPrompt || '').trim();
       const slashMatch = trimmedCustom.match(
@@ -874,6 +1719,61 @@ async function startServer() {
       const activeSlash = slashMatch
         ? (slashMatch[1] || 'help').toLowerCase()
         : null;
+
+      // Onboarding Router (/start, /help, راهنما) works immediately for authenticated users
+      if (activeSlash === 'start' || activeSlash === 'help') {
+        if (!verifiedUser && !String(customApiKey || '').trim()) {
+          return res.status(401).json({
+            ok: false,
+            error:
+              'احراز هویت انجام نشد. لطفاً وارد حساب گوگل شوید یا کلید شخصی خود را ثبت کنید.',
+          });
+        }
+        const onboardingText = `خوش آمدید به «هسته مرکزی هوشمند استودیو آرکا (Arka Studio Enterprise Core)» — متصل به https://arka-acc.ir
+
+لیست کامل ۶ دستور میانبر عملیاتی + استودیو مقاله SEO/AEO/GEO:
+1. /fast [موضوع] — اجرای سریع با gemini-2.5-flash (تولید مستقیم و بدون مقدمه)
+2. /hybrid [موضوع] — حالت ترکیبی (۳ رویکرد متفاوت + ۱ پرسش استراتژیک)
+3. /rpe [موضوع] — معماری عمیق با gemini-2.5-pro (مصاحبه و استراتژی برند/کمپین)
+4. /visual [موضوع] — ماتریس بصری ۸گانه (۸ مؤلفه انگلیسی + Master Prompt + اسلاید بوم)
+5. /video [موضوع] — کارگردان ریلز و موشن (۳ قلاب + جدول ۵ ستونی + Veo Prompt + کاور بوم)
+6. /copy [موضوع] — مهندسی کپی تبدیل‌محور (PAS/AIDA/BAB + اسلایدهای آماده StoryCanvas)
+7. تب «مقاله SEO/AEO/GEO» — تولید مقاله کامل سئو، باکس پاسخ مستقیم هوش مصنوعی، اسکیمای FAQ و لینک‌سازی داخلی.`;
+        return res.json({
+          ok: true,
+          mode,
+          executionMeta: {
+            selectedModel: 'gemini-2.5-flash',
+            plannedModel: 'gemini-2.5-flash',
+            usedFallback: false,
+            modelDisplayName: 'gemini-2.5-flash (راهنمای سیستم)',
+            detectedArkaMode: 'fast_path',
+            detectedSlashCommand: `/${activeSlash}`,
+            reasoningFa: 'پاسخ آنی راهنمای سیستم استودیو آرکا',
+            connectionMode,
+            keySource: 'server-env',
+            jsonModeActive: false,
+            latencyMs: Date.now() - startedAt,
+          },
+          result: { coreMarkdown: onboardingText },
+        });
+      }
+
+      const resolved = resolveAuthorizedGeminiClient({
+        verifiedUser,
+        inlineCustomApiKey: customApiKey,
+        requestedConnectionMode: connectionMode,
+      });
+      if (!resolved.ok) {
+        return res.status(resolved.classifiedError.httpStatus).json({
+          ok: false,
+          error: resolved.classifiedError.messageFa,
+          errorDetails: resolved.classifiedError,
+        });
+      }
+
+      const { ai, keySource } = resolved;
+      const siteContext = await getLiveArkaSiteContext(false);
 
       const isJsonFlagActive =
         Boolean(jsonMode) ||
@@ -885,25 +1785,57 @@ async function startServer() {
         mode,
         isJsonFlagActive
       );
+      plannedRouterModel = modelDecision.modelId;
 
-      // Inspect available models on this key before running generation
-      let availableModels: string[] = [];
-      try {
-        availableModels = await listAvailableGeminiModels(ai, fingerprint);
-      } catch {
-        availableModels = ['gemini-2.5-flash', 'gemini-2.5-pro'];
+      // Capability validation before execution
+      const capabilityCheck = validateModelCapabilityForTask(
+        modelDecision.modelId,
+        modelDecision.requiredCapability
+      );
+      if (!capabilityCheck.supported) {
+        return res.status(400).json({
+          ok: false,
+          error: capabilityCheck.reasonFa,
+          errorDetails: {
+            errorCode: 'UNSUPPORTED_CAPABILITY',
+            httpStatus: 400,
+            messageFa:
+              capabilityCheck.reasonFa ||
+              'مدل انتخاب‌شده از قابلیت درخواستی پشتیبانی نمی‌کند.',
+            retryable: false,
+            canFallbackToFlash: false,
+            suggestedFallbackModel: null,
+          },
+        });
       }
 
-      let routedModelId: GeminiRouterModelId = modelDecision.modelId;
-      let preflightAdjusted = false;
-      if (
-        routedModelId === 'gemini-2.5-pro' &&
-        availableModels.length > 0 &&
-        !availableModels.some((m) => m.includes('2.5-pro')) &&
-        availableModels.some((m) => m.includes('2.5-flash'))
-      ) {
-        routedModelId = 'gemini-2.5-flash';
-        preflightAdjusted = true;
+      // Synthetic test hook for automated test suite (only when ARKA_TEST_ALLOW_SYNTHETIC_KEYS === '1')
+      if (process.env.ARKA_TEST_ALLOW_SYNTHETIC_KEYS === '1') {
+        if (trimmedCustom.includes('__TEST_SIMULATE_429__')) {
+          if (!allowModelFallback && plannedRouterModel === 'gemini-2.5-pro') {
+            const err429: any = new Error('Quota exceeded for model gemini-2.5-pro');
+            err429.status = 429;
+            throw err429;
+          }
+          return res.json({
+            ok: true,
+            mode,
+            executionMeta: {
+              selectedModel: 'gemini-2.5-flash',
+              plannedModel: plannedRouterModel,
+              usedFallback: true,
+              fallbackReason:
+                'انتخاب آگاهانه کاربر ← اجرای مجدد درخواست با مدل جایگزین gemini-2.5-flash',
+              modelDisplayName: modelDecision.modelDisplayName,
+              detectedArkaMode: modelDecision.detectedArkaMode,
+              reasoningFa: modelDecision.reasoningFa,
+              connectionMode,
+              keySource,
+              latencyMs: Date.now() - startedAt,
+            },
+            result: { coreMarkdown: 'پاسخ موفق با مدل جایگزین gemini-2.5-flash' },
+          });
+        }
       }
 
       const buildExecutionMeta = (
@@ -913,12 +1845,8 @@ async function startServer() {
       ) => ({
         selectedModel: actualModelUsed,
         plannedModel: modelDecision.modelId,
-        usedFallback: usedFallback || preflightAdjusted,
-        fallbackReason:
-          fallbackReason ||
-          (preflightAdjusted
-            ? 'مدل Pro روی این کلید یافت نشد ← مسیریابی پیش‌فرض به gemini-2.5-flash'
-            : undefined),
+        usedFallback,
+        fallbackReason,
         modelDisplayName: modelDecision.modelDisplayName,
         detectedArkaMode: modelDecision.detectedArkaMode,
         detectedSlashCommand: modelDecision.detectedSlashCommand,
@@ -946,37 +1874,19 @@ async function startServer() {
           ? 'ماژول فعال: 6. Conversion Copywriting & Canvas Slide Engine (mode: "copy_engine" / /copy) — در data.copywriting: strategy، دقیقاً ۳ تیتر در headline_hooks، اسلایدهای structured_blocks، conversion_triggers و همچنین آرایه کامل canvas_slides آماده تزریق به StoryCanvas تولید کن.'
           : '';
 
+      const brandContextBlock = brandContextSummary
+        ? `\n[پروفایل قطب هوش برند کاربر (Brand Intelligence Hub)]:\n${brandContextSummary}\n`
+        : '';
+
       const systemInstruction = `${ARKA_SYSTEM_INSTRUCTION}
 
 تمامی متن‌های فارسی باید ۱۰۰٪ به زبان فارسی سلیس، استاندارد، بدون غلط املایی و منحصراً بر اساس ویژگی‌های واقعی نرم‌افزار حسابداری آرکا (https://arka-acc.ir) شامل دموی رایگان ۱۰۰ سند، ۱ سال پشتیبانی رایگان، سرویس مستقیم سامانه مؤدیان، و ۸ سیستم تخصصی پاچال، سوله، ترخیص، منو، پروژه، ویترین، شتاب و پکیج جامع نوشته شوند.
 تلفن رسمی آرکا: 051-36079047 | وب‌سایت: arka-acc.ir | آدرس: مشهد، سید رضی ۴۰، پلاک ۲۶۵.
-${slashDirective ? `\n${slashDirective}\n` : ''}
+${brandContextBlock}${slashDirective ? `\n${slashDirective}\n` : ''}
 دانش زنده و کاتالوگ ۸ سیستم سایت آرکا:
 ${siteContext.summary}`;
 
-      // Onboarding Router (/start, /help, راهنما)
-      if (activeSlash === 'start' || activeSlash === 'help') {
-        const onboardingText = `خوش آمدید به «هسته مرکزی هوشمند استودیو آرکا (Arka Studio Enterprise Core)» — متصل به https://arka-acc.ir
-
-لیست کامل ۶ دستور میانبر عملیاتی:
-1. /fast [موضوع] — اجرای سریع با gemini-2.5-flash (تولید مستقیم و بدون مقدمه)
-2. /hybrid [موضوع] — حالت ترکیبی (۳ رویکرد متفاوت + ۱ پرسش استراتژیک)
-3. /rpe [موضوع] — معماری عمیق با gemini-2.5-pro (مصاحبه و استراتژی برند/کمپین)
-4. /visual [موضوع] — ماتریس بصری ۸گانه (۸ مؤلفه انگلیسی + Master Prompt + اسلاید بوم)
-5. /video [موضوع] — کارگردان ریلز و موشن (۳ قلاب + جدول ۵ ستونی + Veo Prompt + کاور بوم)
-6. /copy [موضوع] — مهندسی کپی تبدیل‌محور (PAS/AIDA/BAB + اسلایدهای آماده StoryCanvas)
-
-نکته: تمامی خروجی‌های ۶ماژوله آماده تزریق مستقیم به بوم StoryCanvas و ذخیره در Google Sheets و Drive هستند.`;
-        return res.json({
-          ok: true,
-          mode,
-          executionMeta: buildExecutionMeta('gemini-2.5-flash', false),
-          result: { coreMarkdown: onboardingText },
-        });
-      }
-
       // Structured 6-Module Enterprise Engine:
-      // Activated when --json / JSON Mode is active OR when any of /hybrid, /rpe, /visual, /video, /copy is used
       const isEnterpriseStructuredSlash =
         activeSlash !== null &&
         ['hybrid', 'rpe', 'visual', 'video', 'copy'].includes(activeSlash);
@@ -997,10 +1907,11 @@ ${siteContext.summary}`;
 3. بر اساس ماژول فعال، بخش متناظر در "data" (یعنی variants یا visual_matrix یا video_production با ۳ قلاب و جدول ۵ ستونی و ai_video_prompt انگلیسی، یا copywriting با ۳ تیتر و structured_blocks) را کاملاً دقیق، کاربردی و غنی تکمیل کن.`;
 
         const { response, actualModelUsed, usedFallback, fallbackReason } =
-          await generateContentWithSmartFallback({
+          await executeGeminiGeneration({
             ai,
-            primaryModel: routedModelId,
+            primaryModel: plannedRouterModel,
             fallbackModel: modelDecision.fallbackModelId,
+            allowModelFallback: Boolean(allowModelFallback),
             contents: jsonPrompt,
             config: {
               systemInstruction,
@@ -1019,13 +1930,10 @@ ${siteContext.summary}`;
           canvas_slides: Array.isArray(parsed?.canvas_slides)
             ? parsed.canvas_slides
             : [],
-          data: parsed?.data || parsed || {},
+          data: parsed?.data || {},
           interaction: parsed?.interaction || {
             clarifying_questions: [],
-            suggested_next_steps: [
-              'تزریق مستقیم اسلاید به بوم StoryCanvas',
-              'ذخیره تصویر PNG یا جدول در Google Drive / Sheets',
-            ],
+            suggested_next_steps: [],
           },
         };
 
@@ -1041,14 +1949,16 @@ ${siteContext.summary}`;
         });
       }
 
-      // Fast-Path plain execution (/fast without --json)
+      // Fast-Path (/fast) Markdown Execution
       if (activeSlash === 'fast') {
-        const fastPrompt = `محصول: ${productName} | مخاطب: ${targetAudience} | هدف: ${campaignGoal} | لحن: ${tone}\nدرخواست کاربر: ${trimmedCustom}`;
+        const fastPrompt = `درخواست کاربر (${trimmedCustom}) را برای محصول «${productName}» از گروه نرم‌افزاری آرکا (https://arka-acc.ir) با لحن «${tone}» ویژه «${targetAudience}» و هدف «${campaignGoal}» به صورت مستقیم، دقیق و بدون هیچ مقدمه اضافی اجرا کن.`;
+
         const { response, actualModelUsed, usedFallback, fallbackReason } =
-          await generateContentWithSmartFallback({
+          await executeGeminiGeneration({
             ai,
-            primaryModel: routedModelId,
-            fallbackModel: 'gemini-2.5-flash',
+            primaryModel: plannedRouterModel,
+            fallbackModel: modelDecision.fallbackModelId,
+            allowModelFallback: Boolean(allowModelFallback),
             contents: fastPrompt,
             config: {
               systemInstruction,
@@ -1069,19 +1979,67 @@ ${siteContext.summary}`;
         });
       }
 
-      if (mode === 'canvas-slide') {
-        const prompt = `یک محتوای کامل برای بوم گرافیکی اینستاگرام (استوری یا پست تک‌صفحه) ویژه محصول «${productName}» از نرم‌افزار حسابداری آرکا طراحی کن.
-مخاطب هدف: ${targetAudience}
-هدف تبلیغاتی: ${campaignGoal}
-لحن: ${tone}
-${customPrompt ? `توضیحات تکمیلی کاربر: ${customPrompt}` : ''}
-دقیقاً ۴ آیتم در آرایه items تولید کن تا بوم گرافیکی کامل و متوازن باشد.`;
+      // NEW MODULE: SEO / AEO / GEO Article Studio (mode === 'seo-article')
+      if (mode === 'seo-article') {
+        const prompt = `یک مقاله جامع، عمیق و کاملاً بهینه‌شده برای موتورهای جستجو (SEO)، موتورهای پاسخ‌گو (AEO - Answer Engine Optimization) و موتورهای مولد هوش مصنوعی (GEO - Generative Engine Optimization) برای وب‌سایت رسمی گروه نرم‌افزاری آرکا (https://arka-acc.ir) با محوریت محصول «${productName}» بنویس.
+- مخاطب هدف: ${targetAudience}
+- هدف تجاری و CTA: ${campaignGoal}
+- لحن: ${tone}
+- کلمات کلیدی پیشنهادی کاربر: ${articleKeywords || productName}
+- نیت جستجوی هدف (Search Intent): ${articleSearchIntent || 'Commercial'}
+${customPrompt ? `- موضوع و نکات اختصاصی کاربر: ${customPrompt}` : ''}
+
+الزامات مقاله SEO / AEO / GEO:
+1. عنوان H1 جذاب، Meta Title استاندارد (تا ۶۰ کاراکتر)، Meta Description متقاعدکننده (۱۴۰ تا ۱۶۰ کاراکتر) و URL Slug انگلیسی.
+2. کلمه کلیدی اصلی + حداقل ۶ کلمه کلیدی فرعی و هم‌خانواده (LSI) + تحلیل فارسی نیت جستجوی کاربر.
+3. باکس پاسخ مستقیم (aeoDirectAnswerBox) در ۴۰ تا ۶۰ کلمه که دقیقاً به سوال اصلی کاربر پاسخ دهد تا در Featured Snippet گوگل و پاسخ‌های صوتی/هوشمند قرار بگیرد.
+4. خلاصه استنادی GEO (geoCitationSummary) شامل آمار و واقعیت‌های ساختاریافته آرکا (بیش از ۱۰ سال تجربه، دموی رایگان ۱۰۰ سند در arka-acc.ir/demo، ۱ سال پشتیبانی رایگان، اتصال مستقیم سامانه مؤدیان و ۸ زیرسیستم تخصصی) برای استناد در ChatGPT، Perplexity و Google AI Overviews.
+5. حداقل ۵ بخش ساختاریافته (H2 و H3) با پاراگراف‌های کامل، تخصصی و کاربردی به همراه نکته کلیدی هر بخش.
+6. حداقل ۴ پرسش و پاسخ متداول (FAQ Schema) دقیق.
+7. حداقل ۴ پیشنهاد لینک‌سازی داخلی با انکرتکست دقیق به صفحات واقعی https://arka-acc.ir ، https://arka-acc.ir/demo ، https://arka-acc.ir/products و https://arka-acc.ir/pages/tax .
+8. یک پست تخصصی لینکدین، یک کپشن اینستاگرام و یک اسلاید کاور مقاله (heroSlide) آماده تزریق به StoryCanvas.`;
 
         const { response, actualModelUsed, usedFallback, fallbackReason } =
-          await generateContentWithSmartFallback({
+          await executeGeminiGeneration({
             ai,
-            primaryModel: routedModelId,
+            primaryModel: plannedRouterModel,
             fallbackModel: modelDecision.fallbackModelId,
+            allowModelFallback: Boolean(allowModelFallback),
+            contents: prompt,
+            config: {
+              systemInstruction,
+              responseMimeType: 'application/json',
+              responseSchema: SEO_ARTICLE_SCHEMA,
+            },
+          });
+
+        const parsed = extractSafeJson(response.text || '{}');
+        return res.json({
+          ok: true,
+          mode: 'seo-article',
+          executionMeta: buildExecutionMeta(
+            actualModelUsed,
+            usedFallback,
+            fallbackReason
+          ),
+          result: parsed,
+        });
+      }
+
+      if (mode === 'canvas-slide') {
+        const prompt = `یک اسلاید استوری یا پست اینستاگرامی پرفروش به همراه کپشن کامل برای محصول «${productName}» از گروه نرم‌افزاری آرکا (arka-acc.ir) تولید کن.
+مخاطب هدف: ${targetAudience}
+هدف کمپین: ${campaignGoal}
+لحن: ${tone}
+${customPrompt ? `دستور اختصاصی کاربر: ${customPrompt}` : ''}
+حتماً ۴ کارت ویژگی دقیق در آرایه items قرار بده و کپشن کامل اینستاگرام با هشتگ‌ها را در فیلد instagramCaption بنویس.`;
+
+        const { response, actualModelUsed, usedFallback, fallbackReason } =
+          await executeGeminiGeneration({
+            ai,
+            primaryModel: plannedRouterModel,
+            fallbackModel: modelDecision.fallbackModelId,
+            allowModelFallback: Boolean(allowModelFallback),
             contents: prompt,
             config: {
               systemInstruction,
@@ -1112,10 +2070,11 @@ ${customPrompt ? `توضیحات تکمیلی کاربر: ${customPrompt}` : ''}
 اسلاید ۱ باید قلاب (Hook) قدرتمند باشد، اسلایدهای ۲ تا ۴ مزایا و راهکارهای دقیق آرکا را تشریح کنند و اسلاید ۵ دعوت به اقدام (دانلود دموی ۱۰۰ سند رایگان از arka-acc.ir و تماس 051-36079047) باشد. هر اسلاید باید دقیقاً ۴ کارت در items داشته باشد.`;
 
         const { response, actualModelUsed, usedFallback, fallbackReason } =
-          await generateContentWithSmartFallback({
+          await executeGeminiGeneration({
             ai,
-            primaryModel: routedModelId,
+            primaryModel: plannedRouterModel,
             fallbackModel: modelDecision.fallbackModelId,
+            allowModelFallback: Boolean(allowModelFallback),
             contents: prompt,
             config: {
               systemInstruction,
@@ -1159,10 +2118,11 @@ ${customPrompt ? `درخواست اختصاصی کاربر: ${customPrompt}` : '
 سناریو باید شامل دقیقاً ۳ قلاب متفاوت برای ۳ ثانیه اول، سکانس‌بندی دقیق (تصویر/موشن، متن نریشن گوینده، نوشته روی تصویر و پرامپت انگلیسی ساخت ویدیو برای Veo)، پیشنهاد موسیقی/افکت صوتی، کپشن کامل و یک اسلاید کاور آماده (coverSlide) برای تزریق مستقیم به بوم استودیو باشد.`;
 
         const { response, actualModelUsed, usedFallback, fallbackReason } =
-          await generateContentWithSmartFallback({
+          await executeGeminiGeneration({
             ai,
-            primaryModel: routedModelId,
+            primaryModel: plannedRouterModel,
             fallbackModel: modelDecision.fallbackModelId,
+            allowModelFallback: Boolean(allowModelFallback),
             contents: prompt,
             config: {
               systemInstruction,
@@ -1249,10 +2209,11 @@ ${customPrompt ? `نکات اختصاصی کاربر: ${customPrompt}` : ''}
 - برای هر روز، فیلدهای دقیق تیتر و زیرتیتر را بده تا کاربر بتواند هر روز دلخواه را با یک کلیک مستقیماً وارد بوم گرافیکی استودیو کند و کل جدول ۳۰ روزه را به عنوان فایل Spreadsheet در Google Drive ذخیره نماید.`;
 
         const { response, actualModelUsed, usedFallback, fallbackReason } =
-          await generateContentWithSmartFallback({
+          await executeGeminiGeneration({
             ai,
-            primaryModel: routedModelId,
+            primaryModel: plannedRouterModel,
             fallbackModel: modelDecision.fallbackModelId,
+            allowModelFallback: Boolean(allowModelFallback),
             contents: prompt,
             config: {
               systemInstruction,
@@ -1374,10 +2335,11 @@ ${customPrompt ? `نکات مدنظر کاربر: ${customPrompt}` : ''}
 همچنین یک اسلاید اصلی کمپین (heroSlide) در خروجی قرار بده تا کاربر بتواند با یک کلیک آن را وارد بوم طراحی کند.`;
 
       const { response, actualModelUsed, usedFallback, fallbackReason } =
-        await generateContentWithSmartFallback({
+        await executeGeminiGeneration({
           ai,
-          primaryModel: routedModelId,
+          primaryModel: plannedRouterModel,
           fallbackModel: modelDecision.fallbackModelId,
+          allowModelFallback: Boolean(allowModelFallback),
           contents: prompt,
           config: {
             systemInstruction,
@@ -1436,16 +2398,21 @@ ${customPrompt ? `نکات مدنظر کاربر: ${customPrompt}` : ''}
         result: parsed,
       });
     } catch (err: any) {
-      const status =
-        typeof err?.status === 'number' && err.status >= 400 ? err.status : 500;
-      return res.status(status).json({
+      const classified = classifyGeminiError(err, plannedRouterModel);
+      return res.status(classified.httpStatus).json({
         ok: false,
-        error:
-          err?.message ||
-          'خطا در ارتباط با موتور هوش مصنوعی آرکا. لطفاً کلید یا اتصال اینترنت را بررسی کنید.',
+        error: classified.messageFa,
+        errorDetails: classified,
       });
     }
   });
+
+  return app;
+}
+
+async function startServer() {
+  const app = createArkaExpressApp();
+  const PORT = 3000;
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -1468,4 +2435,6 @@ ${customPrompt ? `نکات مدنظر کاربر: ${customPrompt}` : ''}
   });
 }
 
-startServer();
+if (process.env.ARKA_TEST_MODE !== '1') {
+  startServer();
+}

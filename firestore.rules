@@ -37,7 +37,7 @@ service cloud.firestore {
         && data.userId.size() <= 128
         && data.userId.matches('^[a-zA-Z0-9_\\-]+$')
         && data.mode is string
-        && data.mode in ['canvas-slide', 'carousel-deck', 'reels-script', 'campaign-plan', 'campaign-calendar-30']
+        && data.mode in ['canvas-slide', 'carousel-deck', 'reels-script', 'campaign-plan', 'campaign-calendar-30', 'seo-article']
         && data.productId is string
         && data.productId.size() >= 1
         && data.productId.size() <= 100
@@ -50,7 +50,7 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
-    function isValidUserSettingRecord(data, userId) {
+    function isValidUserPreferenceRecord(data, userId) {
       return data.keys().hasAll(['userId', 'darkMode', 'preferredConnectionMode', 'updatedAt'])
         && data.keys().hasOnly(['userId', 'darkMode', 'preferredConnectionMode', 'updatedAt'])
         && data.userId is string
@@ -59,6 +59,23 @@ service cloud.firestore {
         && data.darkMode is bool
         && data.preferredConnectionMode in ['gmail-authenticated', 'custom-byok', 'studio-creator-core']
         && data.updatedAt is timestamp;
+    }
+
+    function isValidBrandProfileRecord(data, userId) {
+      return data.keys().hasAll(['userId', 'profileJson', 'updatedAt'])
+        && data.keys().hasOnly(['userId', 'profileJson', 'updatedAt'])
+        && data.userId is string
+        && data.userId == userId
+        && data.userId == request.auth.uid
+        && data.profileJson is string
+        && data.profileJson.size() >= 2
+        && data.profileJson.size() <= 20000
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSettingDocument(settingId, data, userId) {
+      return (settingId == 'preferences' && isValidUserPreferenceRecord(data, userId))
+        || (settingId == 'brandProfile' && isValidBrandProfileRecord(data, userId));
     }
 
     match /users/{userId}/aiGenerations/{genId} {
@@ -84,7 +101,7 @@ service cloud.firestore {
       allow create, update: if isOwner(userId)
         && isValidId(userId)
         && isValidId(settingId)
-        && isValidUserSettingRecord(incoming(), userId)
+        && isValidSettingDocument(settingId, incoming(), userId)
         && incoming().updatedAt == request.time;
       allow delete: if isOwner(userId) && isValidId(userId) && isValidId(settingId);
     }
