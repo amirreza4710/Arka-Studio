@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { User } from 'firebase/auth';
 import {
   ARKA_SITE_CATALOG,
@@ -102,6 +102,71 @@ interface ArkaAIStudioPanelProps {
   }) => void;
 }
 
+type SlashCommandTag =
+  | '/fast'
+  | '/hybrid'
+  | '/rpe'
+  | '/visual'
+  | '/video'
+  | '/copy';
+
+interface SlashCommandOption {
+  command: SlashCommandTag;
+  shortLabel: string;
+  modeTitle: string;
+  placeholder: string;
+  suggestedAiMode?: AiGenMode;
+}
+
+const SLASH_COMMAND_MODES: SlashCommandOption[] = [
+  {
+    command: '/fast',
+    shortLabel: 'سریع',
+    modeTitle: 'Fast-Path · خروجی فوری و مستقیم بدون مقدمه',
+    placeholder:
+      'دستور /fast فعال شد: موضوع یا ویرایش صریح خود را بنویسید تا مستقیماً خروجی نهایی و آماده اجرا تولید شود...',
+  },
+  {
+    command: '/hybrid',
+    shortLabel: 'ترکیبی',
+    modeTitle: 'Hybrid Mode · پیش‌نویس کامل + ۱ پرسش استراتژیک',
+    placeholder:
+      'دستور /hybrid فعال شد: هدف کلی کمپین یا استوری آرکا را بنویسید تا پیش‌نویس کامل همراه با ۱ سوال کلیدی دریافت کنید...',
+  },
+  {
+    command: '/rpe',
+    shortLabel: 'عمیق',
+    modeTitle: 'Deep RPE · معماری عمیق برند و استراتژی کمپین',
+    placeholder:
+      'دستور /rpe فعال شد: ابعاد پروژه، چرخه فروش یا استراتژی کلان نرم‌افزار آرکا را برای مهندسی عمیق شرح دهید...',
+    suggestedAiMode: 'campaign-calendar-30',
+  },
+  {
+    command: '/visual',
+    shortLabel: 'بصری',
+    modeTitle: 'Visual Matrix · مهندسی پرامپت بصری و گرافیک بوم',
+    placeholder:
+      'دستور /visual فعال شد: ایده صحنه، چیدمان گرافیکی یا فضای بصری مدنظر برای بوم اینستاگرام آرکا را بنویسید...',
+    suggestedAiMode: 'canvas-slide',
+  },
+  {
+    command: '/video',
+    shortLabel: 'ویدیو',
+    modeTitle: 'Video Director · کارگردانی ریلز، ۳ قلاب و دکوپاژ',
+    placeholder:
+      'دستور /video فعال شد: سوژه ریلز یا موشن‌گرافیک آرکا را بنویسید تا ۳ قلاب اول و جدول دکوپاژ ثانیه‌به‌ثانیه تولید شود...',
+    suggestedAiMode: 'reels-script',
+  },
+  {
+    command: '/copy',
+    shortLabel: 'کپی‌رایتینگ',
+    modeTitle: 'Copy Engine · کپی‌رایتینگ تبدیل‌محور (PAS / AIDA / BAB)',
+    placeholder:
+      'دستور /copy فعال شد: مزیت رقابتی یا پیشنهاد فروش آرکا (مثل ۱۰۰ سند دموی رایگان) را برای نگارش متن متقاعدکننده بنویسید...',
+    suggestedAiMode: 'carousel-deck',
+  },
+];
+
 export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
   currentUser,
   accessToken,
@@ -128,6 +193,38 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     'حرفه‌ای، خلاقانه، متقاعدکننده و منطبق با بازار ایران'
   );
   const [customPrompt, setCustomPrompt] = useState<string>('');
+  const [activeSlashCommand, setActiveSlashCommand] =
+    useState<SlashCommandTag | null>(null);
+  const [promptPlaceholder, setPromptPlaceholder] = useState<string>(
+    'مثلاً: تاکید روی اینکه با ۱۰۰ سند دموی رایگان می‌توانند کل انبار و فاکتورهای فروشگاه را بدون ریسک تست کنند...'
+  );
+  const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const handleSelectSlashCommand = (option: SlashCommandOption) => {
+    setActiveSlashCommand(option.command);
+    setPromptPlaceholder(option.placeholder);
+    if (option.suggestedAiMode) {
+      setMode(option.suggestedAiMode);
+    }
+
+    setCustomPrompt((prev) => {
+      // Remove any existing leading slash command (/fast, /hybrid, /rpe, /visual, /video, /copy)
+      const stripped = prev
+        .replace(/^\/(fast|hybrid|rpe|visual|video|copy)\b\s*/i, '')
+        .trimStart();
+      return stripped ? `${option.command} ${stripped}` : `${option.command} `;
+    });
+
+    // Auto-focus the input field and place cursor at the end
+    requestAnimationFrame(() => {
+      const el = promptInputRef.current;
+      if (el) {
+        el.focus();
+        const len = el.value.length;
+        el.setSelectionRange(len, len);
+      }
+    });
+  };
 
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -896,16 +993,73 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
                 </div>
               </div>
 
-              <div>
-                <label className="block text-xs font-bold text-[#062959] mb-1">
-                  ۵. نکته یا ایده اختصاصی شما (اختیاری)
-                </label>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="block text-xs font-bold text-[#062959]">
+                    ۵. دستورات میانبر نئونی و پرامپت اختصاصی شما
+                  </label>
+                  {activeSlashCommand && (
+                    <span className="text-[11px] font-black text-[#089f93] dir-ltr">
+                      حالت فعال: {activeSlashCommand}
+                    </span>
+                  )}
+                </div>
+
+                {/* Row of 6 Neon-Styled Mode Buttons above the AI Chat Input Field */}
+                <div
+                  role="group"
+                  aria-label="دستورات میانبر ماژول‌های شش‌گانه هوش مصنوعی آرکا"
+                  className="p-2 rounded-xl bg-[#062959] border border-[#08cdbd]/50 grid grid-cols-3 sm:grid-cols-6 gap-1.5 shadow-inner"
+                >
+                  {SLASH_COMMAND_MODES.map((item) => {
+                    const isActive =
+                      activeSlashCommand === item.command ||
+                      customPrompt.trimStart().startsWith(item.command);
+                    return (
+                      <button
+                        key={item.command}
+                        type="button"
+                        onClick={() => handleSelectSlashCommand(item)}
+                        title={item.modeTitle}
+                        className={`px-2 py-1.5 rounded-lg text-[11px] font-black transition-all cursor-pointer flex flex-col items-center justify-center gap-0.5 border min-h-[42px] ${
+                          isActive
+                            ? 'bg-[#08cdbd]/20 text-[#14dac3] border-[#14dac3] shadow-[0_0_12px_rgba(20,218,195,0.55)]'
+                            : 'bg-[#0b2b56]/90 text-[#a4d2d1] border-[#14dac3]/35 hover:text-[#14dac3] hover:border-[#14dac3] hover:shadow-[0_0_10px_rgba(20,218,195,0.35)]'
+                        }`}
+                      >
+                        <span
+                          dir="ltr"
+                          className="font-mono text-[11px] tracking-tight text-[#14dac3] font-black leading-none"
+                        >
+                          {item.command}
+                        </span>
+                        <span className="text-[10px] font-bold text-white/90 leading-tight">
+                          {item.shortLabel}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+
                 <textarea
-                  rows={2}
+                  ref={promptInputRef}
+                  rows={3}
                   value={customPrompt}
-                  onChange={(e) => setCustomPrompt(e.target.value)}
-                  placeholder="مثلاً: تاکید روی اینکه با ۱۰۰ سند دموی رایگان می‌توانند کل انبار و فاکتورهای فروشگاه را بدون ریسک تست کنند..."
-                  className="w-full bg-[#f5f8fa] border border-[#e3e9ed] focus:border-[#08cdbd] rounded-xl px-3 py-2 text-xs text-[#233b53] outline-none"
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setCustomPrompt(val);
+                    const matched = SLASH_COMMAND_MODES.find((m) =>
+                      val.trimStart().startsWith(m.command)
+                    );
+                    if (matched) {
+                      setActiveSlashCommand(matched.command);
+                      setPromptPlaceholder(matched.placeholder);
+                    } else if (!val.trim()) {
+                      setActiveSlashCommand(null);
+                    }
+                  }}
+                  placeholder={promptPlaceholder}
+                  className="w-full bg-[#f5f8fa] border border-[#e3e9ed] focus:border-[#08cdbd] focus:ring-2 focus:ring-[#14dac3]/25 rounded-xl px-3 py-2.5 text-xs text-[#233b53] outline-none transition-all"
                 />
               </div>
 

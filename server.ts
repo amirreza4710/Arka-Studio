@@ -202,10 +202,31 @@ async function startServer() {
       const ai = getGeminiClient();
       const siteContext = await getLiveArkaSiteContext(false);
 
-      const systemInstruction = `تو کارگردان خلاق مارکتینگ، کپی‌رایتر ارشد اینستاگرام و متخصص محصولات «گروه نرم‌افزاری آرکــا» (https://arka-acc.ir) هستی.
+      const trimmedCustom = String(customPrompt || '').trim();
+      const slashMatch = trimmedCustom.match(
+        /^\/(fast|hybrid|rpe|visual|video|copy)\b/i
+      );
+      const activeSlash = slashMatch ? slashMatch[1].toLowerCase() : null;
+
+      const slashDirective =
+        activeSlash === 'fast'
+          ? 'ماژول فعال: Fast-Path (/fast) — بدون هیچ مقدمه یا کلیشه، مستقیماً خروجی نهایی، صریح، فشرده و آماده اجرا تولید کن.'
+          : activeSlash === 'hybrid'
+          ? 'ماژول فعال: Hybrid Mode (/hybrid) — یک پیش‌نویس کامل و قدرتمند بر اساس بهترین فرض حرفه‌ای ارائه بده و در انتهای کپشن، دقیقاً ۱ پرسش استراتژیک برای شخصی‌سازی نسخه بعدی مطرح کن.'
+          : activeSlash === 'rpe'
+          ? 'ماژول فعال: Deep RPE (/rpe) — معماری استراتژیک عمیق برند، تحلیل دقیق نقاط درد صنف و چرخه کامل متقاعدسازی را در تمام بخش‌ها پیاده‌سازی کن.'
+          : activeSlash === 'visual'
+          ? 'ماژول فعال: Modular Visual Matrix (/visual) — بر چیدمان بصری، کنتراست رنگی سرمه‌ای و فیروزه‌ای آرکا، تایپوگرافی شاخص و جزئیات گرافیکی بوم تمرکز ویژه داشته باش.'
+          : activeSlash === 'video'
+          ? 'ماژول فعال: Video Director Engine (/video) — قلاب‌های ۳ ثانیه اول شوکه‌کننده/نتیجه‌محور، ریتم تند و دکوپاژ ثانیه‌به‌ثانیه دقیق کارگردانی کن.'
+          : activeSlash === 'copy'
+          ? 'ماژول فعال: Conversion Copywriting Engine (/copy) — از فریم‌ورک‌های متقاعدسازی PAS، AIDA و BAB، تیترهای Scroll-Stopper و میکروکپی حذف ریسک (۱۰۰ سند دموی رایگان) استفاده کن.'
+          : '';
+
+      const systemInstruction = `تو «هسته مرکزی هوشمند استودیو آرکا (Arka Studio Core AI)»؛ کارگردان خلاق مارکتینگ، کپی‌رایتر ارشد اینستاگرام و متخصص محصولات «گروه نرم‌افزاری آرکــا» (https://arka-acc.ir) هستی.
 تمامی محتواها باید ۱۰۰٪ به زبان فارسی سلیس، استاندارد، بدون غلط املایی و منحصراً بر اساس ویژگی‌های واقعی نرم‌افزار حسابداری آرکا (از جمله دموی رایگان ۱۰۰ سند، ۱ سال پشتیبانی رایگان، سرویس مستقیم سامانه مؤدیان، و ۸ سیستم تخصصی پاچال، سوله، ترخیص، منو، پروژه، ویترین، شتاب و پکیج جامع) نوشته شوند.
 تلفن رسمی آرکا: 051-36079047 | وب‌سایت: arka-acc.ir | آدرس: مشهد، سید رضی ۴۰، پلاک ۲۶۵.
-
+${slashDirective ? `\n${slashDirective}\n` : ''}
 دانش پایه سایت آرکا:
 ${siteContext.summary}`;
 
