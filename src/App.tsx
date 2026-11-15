@@ -44,6 +44,7 @@ import {
   saveUserStudioPreferences,
   fetchUserStudioPreferences,
   getAccessToken,
+  getFirebaseIdToken,
 } from './firebase';
 import {
   ArkaConnectionSource,
@@ -567,9 +568,17 @@ export default function App() {
     setIsTestingByok(true);
     setByokVerifyError(null);
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      const idToken = await getFirebaseIdToken();
+      if (idToken) {
+        headers.Authorization = `Bearer ${idToken}`;
+      }
+
       const resp = await fetch('/api/arka-ai/verify-key', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           customApiKey: trimmed,
           provider: 'gemini',

@@ -12,6 +12,7 @@ import {
   fetchUserAiGenerations,
   deleteUserAiGeneration,
   getAccessToken,
+  getFirebaseIdToken,
 } from '../firebase';
 import {
   ARKA_SLASH_COMMANDS,
@@ -410,9 +411,23 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     setIsVerifyingConnection(true);
     setErrorMsg(null);
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (!isByokActive) {
+        const idToken = await getFirebaseIdToken();
+        if (!idToken) {
+          const authMsg = 'برای استفاده وارد شوید یا کلید شخصی ثبت کنید';
+          setErrorMsg(authMsg);
+          onEmitTelemetryLog?.('warn', 'Auth', authMsg);
+          return;
+        }
+        headers.Authorization = `Bearer ${idToken}`;
+      }
+
       const resp = await fetch('/api/arka-ai/verify-connection', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           connectionMode,
           customApiKey: isByokActive ? customApiKey : '',
@@ -541,9 +556,23 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
     );
 
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (!isByokActive) {
+        const idToken = await getFirebaseIdToken();
+        if (!idToken) {
+          const authMsg = 'برای استفاده وارد شوید یا کلید شخصی ثبت کنید';
+          setErrorMsg(authMsg);
+          onEmitTelemetryLog?.('warn', 'Auth', authMsg);
+          return;
+        }
+        headers.Authorization = `Bearer ${idToken}`;
+      }
+
       const response = await fetch('/api/arka-ai/generate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           mode,
           productName: `${selectedProduct.name} (${selectedProduct.group})`,
@@ -554,7 +583,6 @@ export const ArkaAIStudioPanel: React.FC<ArkaAIStudioPanelProps> = ({
           jsonMode: isJsonActive,
           customApiKey: isByokActive ? customApiKey : '',
           connectionMode: activeSource,
-          systemInstruction: ARKA_SYSTEM_INSTRUCTION,
         }),
       });
 

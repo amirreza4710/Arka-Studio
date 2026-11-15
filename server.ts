@@ -1,3 +1,5 @@
+import crypto from 'crypto';
+import fs from 'fs';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -15,6 +17,178 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Read public Firebase Web API key for REST ID token verification (accounts:lookup)
+let firebaseWebApiKey = '';
+try {
+  const fbConfigPath = path.join(__dirname, 'firebase-applet-config.json');
+  const fbConfig = JSON.parse(fs.readFileSync(fbConfigPath, 'utf8'));
+  firebaseWebApiKey = String(fbConfig?.apiKey || '').trim();
+} catch {
+  firebaseWebApiKey = '';
+}
+
+interface VerifiedFirebaseUser {
+  uid: string;
+  email?: string;
+}
+
+function extractBearerToken(req: express.Request): string {
+  const authHeader = String(req.headers.authorization || '').trim();
+  if (!authHeader.toLowerCase().startsWith('bearer ')) {
+    return '';
+  }
+  return authHeader.slice(7).trim();
+}
+
+async function verifyFirebaseIdToken(
+  idToken: string
+): Promise<VerifiedFirebaseUser | null> {
+  const token = String(idToken || '').trim();
+  if (!token || token.length > 8192 || !firebaseWebApiKey) {
+    return null;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const resp = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(
+        firebaseWebApiKey
+      )}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken: token }),
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timer);
+
+    if (!resp.ok) {
+      return null;
+    }
+
+    const data = (await resp.json()) as {
+      users?: Array<{ localId?: string; email?: string }>;
+    };
+    const user = Array.isArray(data?.users) ? data.users[0] : null;
+    if (!user?.localId) {
+      return null;
+    }
+
+    return {
+      uid: String(user.localId),
+      email: user.email ? String(user.email) : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Simple In-Memory Rate Limiter (keyed by userId if authenticated, else IP)
+interface RateLimitBucket {
+  count: number;
+  resetAt: number;
+}
+
+const rateLimitStore = new Map<string, RateLimitBucket>();
+
+const rateLimitCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateLimitStore.entries()) {
+    if (bucket.resetAt <= now) {
+      rateLimitStore.delete(key);
+    }
+  }
+}, 60 * 1000);
+rateLimitCleanupTimer.unref?.();
+
+function getClientIp(req: express.Request): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',')[0].trim();
+  }
+  if (Array.isArray(forwarded) && forwarded[0]) {
+    return String(forwarded[0]).split(',')[0].trim();
+  }
+  return String(req.ip || req.socket?.remoteAddress || 'unknown');
+}
+
+function checkRateLimit(params: {
+  endpoint: string;
+  userId?: string | null;
+  ip: string;
+  limit: number;
+  windowMs?: number;
+}): { allowed: boolean; retryAfterSeconds: number; remaining: number } {
+  const now = Date.now();
+  const windowMs = params.windowMs ?? 60 * 1000;
+  const actorKey = params.userId ? `uid:${params.userId}` : `ip:${params.ip}`;
+  const bucketKey = `${params.endpoint}:${actorKey}`;
+
+  if (rateLimitStore.size > 10000 && !rateLimitStore.has(bucketKey)) {
+    for (const [k, b] of rateLimitStore.entries()) {
+      if (b.resetAt <= now) rateLimitStore.delete(k);
+    }
+    if (rateLimitStore.size > 10000) {
+      const oldestKey = rateLimitStore.keys().next().value;
+      if (oldestKey) rateLimitStore.delete(oldestKey);
+    }
+  }
+
+  const existing = rateLimitStore.get(bucketKey);
+  if (!existing || existing.resetAt <= now) {
+    rateLimitStore.set(bucketKey, {
+      count: 1,
+      resetAt: now + windowMs,
+    });
+    return {
+      allowed: true,
+      retryAfterSeconds: 0,
+      remaining: Math.max(0, params.limit - 1),
+    };
+  }
+
+  if (existing.count >= params.limit) {
+    const retryAfterSeconds = Math.max(
+      1,
+      Math.ceil((existing.resetAt - now) / 1000)
+    );
+    return {
+      allowed: false,
+      retryAfterSeconds,
+      remaining: 0,
+    };
+  }
+
+  existing.count += 1;
+  return {
+    allowed: true,
+    retryAfterSeconds: 0,
+    remaining: Math.max(0, params.limit - existing.count),
+  };
+}
+
+const MAX_PROMPT_LENGTH = 4000;
+const MAX_TEXT_FIELD_LENGTH = 4000;
+const MAX_SHORT_FIELD_LENGTH = 120;
+const MAX_API_KEY_LENGTH = 512;
+
+function validateTextFields(
+  fields: Array<{ labelFa: string; value: unknown; maxLength: number }>
+): string | null {
+  for (const field of fields) {
+    if (field.value === undefined || field.value === null) continue;
+    if (typeof field.value !== 'string') {
+      return `فرمت فیلد «${field.labelFa}» نامعتبر است و باید متنی باشد.`;
+    }
+    if (field.value.length > field.maxLength) {
+      return `طول فیلد «${field.labelFa}» نباید بیشتر از ${field.maxLength} کاراکتر باشد.`;
+    }
+  }
+  return null;
+}
+
 function createGeminiClient(customApiKey?: string): {
   ai: GoogleGenAI;
   keySource: 'custom-byok' | 'server-env';
@@ -27,7 +201,8 @@ function createGeminiClient(customApiKey?: string): {
       'کلید GEMINI_API_KEY در محیط سرور یافت نشد و کلید شخصی نیز ثبت نشده است. لطفاً کلید شخصی خود را از دکمه «مدیریت اعتبار و API Key» وارد و تایید کنید.'
     );
   }
-  const fingerprint = `${trimmedCustom ? 'byok' : 'env'}:${apiKey.slice(0, 6)}...${apiKey.slice(-4)}`;
+  const digest = crypto.createHash('sha256').update(apiKey).digest('hex').slice(0, 16);
+  const fingerprint = `${trimmedCustom ? 'byok' : 'env'}:${digest}`;
   const ai = new GoogleGenAI({
     apiKey,
     httpOptions: {
@@ -329,7 +504,43 @@ async function startServer() {
   app.post('/api/arka-ai/verify-key', async (req, res) => {
     const startedAt = Date.now();
     try {
-      const { customApiKey = '', provider = 'gemini' } = req.body || {};
+      const bearerToken = extractBearerToken(req);
+      const verifiedUser = bearerToken
+        ? await verifyFirebaseIdToken(bearerToken)
+        : null;
+
+      const rateCheck = checkRateLimit({
+        endpoint: 'verify-key',
+        userId: verifiedUser?.uid || null,
+        ip: getClientIp(req),
+        limit: 5,
+        windowMs: 60 * 1000,
+      });
+      if (!rateCheck.allowed) {
+        res.setHeader('Retry-After', String(rateCheck.retryAfterSeconds));
+        return res.status(429).json({
+          ok: false,
+          valid: false,
+          error: `تعداد درخواست‌های بررسی کلید بیش از حد مجاز (۵ درخواست در دقیقه) است. لطفاً ${rateCheck.retryAfterSeconds} ثانیه صبر کنید.`,
+          retryAfterSeconds: rateCheck.retryAfterSeconds,
+        });
+      }
+
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const fieldError = validateTextFields([
+        { labelFa: 'کلید API شخصی', value: body.customApiKey, maxLength: MAX_API_KEY_LENGTH },
+        { labelFa: 'سرویس‌دهنده (Provider)', value: body.provider, maxLength: 50 },
+      ]);
+      if (fieldError) {
+        return res.status(400).json({
+          ok: false,
+          valid: false,
+          provider: 'gemini',
+          error: fieldError,
+        });
+      }
+
+      const { customApiKey = '', provider = 'gemini' } = body;
       const trimmedKey = String(customApiKey || '').trim();
       if (!trimmedKey || trimmedKey.length < 15) {
         return res.status(400).json({
@@ -396,13 +607,42 @@ async function startServer() {
   // 3. Pre-flight AI Connection Diagnostics & Available Real Gemini Models
   app.get('/api/arka-ai/diagnostics', async (req, res) => {
     try {
+      const bearerToken = extractBearerToken(req);
+      const verifiedUser = bearerToken
+        ? await verifyFirebaseIdToken(bearerToken)
+        : null;
+
+      const rateCheck = checkRateLimit({
+        endpoint: 'diagnostics',
+        userId: verifiedUser?.uid || null,
+        ip: getClientIp(req),
+        limit: 20,
+        windowMs: 60 * 1000,
+      });
+      if (!rateCheck.allowed) {
+        res.setHeader('Retry-After', String(rateCheck.retryAfterSeconds));
+        return res.status(429).json({
+          ok: false,
+          error: `تعداد درخواست‌های بررسی وضعیت بیش از حد مجاز است. لطفاً ${rateCheck.retryAfterSeconds} ثانیه صبر کنید.`,
+          retryAfterSeconds: rateCheck.retryAfterSeconds,
+        });
+      }
+
+      const fieldError = validateTextFields([
+        { labelFa: 'پرامپت نمونه', value: req.query.prompt, maxLength: MAX_PROMPT_LENGTH },
+        { labelFa: 'حالت اجرا', value: req.query.mode, maxLength: MAX_SHORT_FIELD_LENGTH },
+      ]);
+      if (fieldError) {
+        return res.status(400).json({ ok: false, error: fieldError });
+      }
+
       const hasServerKey = Boolean(process.env.GEMINI_API_KEY);
       const samplePrompt = String(req.query.prompt || '');
       const sampleTab = String(req.query.mode || 'campaign-calendar-30');
       const modelDecision = resolveSmartModelForTask(samplePrompt, sampleTab);
 
       let discoveredModels: string[] = ['gemini-2.5-flash', 'gemini-2.5-pro'];
-      if (hasServerKey) {
+      if (hasServerKey && verifiedUser) {
         try {
           const { ai, fingerprint } = createGeminiClient();
           const liveModels = await listAvailableGeminiModels(ai, fingerprint);
@@ -441,16 +681,59 @@ async function startServer() {
     }
   });
 
-  // 4. Live Connection Readiness Verification Endpoint (supports BYOK or Server Key)
+  // 4. Live Connection Readiness Verification Endpoint (supports BYOK or Authenticated Server Key)
   app.post('/api/arka-ai/verify-connection', async (req, res) => {
     const startedAt = Date.now();
     try {
+      const bearerToken = extractBearerToken(req);
+      const verifiedUser = bearerToken
+        ? await verifyFirebaseIdToken(bearerToken)
+        : null;
+
+      const rateCheck = checkRateLimit({
+        endpoint: 'verify-connection',
+        userId: verifiedUser?.uid || null,
+        ip: getClientIp(req),
+        limit: 5,
+        windowMs: 60 * 1000,
+      });
+      if (!rateCheck.allowed) {
+        res.setHeader('Retry-After', String(rateCheck.retryAfterSeconds));
+        return res.status(429).json({
+          ok: false,
+          verified: false,
+          error: `تعداد درخواست‌های تست اتصال بیش از حد مجاز (۵ درخواست در دقیقه) است. لطفاً ${rateCheck.retryAfterSeconds} ثانیه صبر کنید.`,
+          retryAfterSeconds: rateCheck.retryAfterSeconds,
+        });
+      }
+
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const rawCustomKey = typeof body.customApiKey === 'string' ? body.customApiKey.trim() : '';
+      if (!rawCustomKey && !verifiedUser) {
+        return res.status(401).json({
+          ok: false,
+          verified: false,
+          error:
+            'احراز هویت انجام نشد. برای تست اتصال با سهمیه سرور، ابتدا وارد حساب گوگل شوید یا کلید شخصی خود را ثبت کنید.',
+        });
+      }
+
+      const fieldError = validateTextFields([
+        { labelFa: 'دستور سفارشی', value: body.customPrompt, maxLength: MAX_PROMPT_LENGTH },
+        { labelFa: 'تب استودیو', value: body.studioTabMode, maxLength: MAX_SHORT_FIELD_LENGTH },
+        { labelFa: 'حالت اتصال', value: body.connectionMode, maxLength: MAX_SHORT_FIELD_LENGTH },
+        { labelFa: 'کلید API شخصی', value: body.customApiKey, maxLength: MAX_API_KEY_LENGTH },
+      ]);
+      if (fieldError) {
+        return res.status(400).json({ ok: false, verified: false, error: fieldError });
+      }
+
       const {
         connectionMode = 'studio-creator-core',
         customPrompt = '',
         studioTabMode = 'campaign-calendar-30',
         customApiKey = '',
-      } = req.body || {};
+      } = body;
 
       const { ai, keySource, fingerprint } = createGeminiClient(customApiKey);
       const modelDecision = resolveSmartModelForTask(
@@ -522,6 +805,52 @@ async function startServer() {
   app.post('/api/arka-ai/generate', async (req, res) => {
     const startedAt = Date.now();
     try {
+      const bearerToken = extractBearerToken(req);
+      const verifiedUser = bearerToken
+        ? await verifyFirebaseIdToken(bearerToken)
+        : null;
+
+      const rateCheck = checkRateLimit({
+        endpoint: 'generate',
+        userId: verifiedUser?.uid || null,
+        ip: getClientIp(req),
+        limit: 20,
+        windowMs: 60 * 1000,
+      });
+      if (!rateCheck.allowed) {
+        res.setHeader('Retry-After', String(rateCheck.retryAfterSeconds));
+        return res.status(429).json({
+          ok: false,
+          error: `تعداد درخواست‌های تولید محتوا بیش از حد مجاز (۲۰ درخواست در دقیقه) است. لطفاً ${rateCheck.retryAfterSeconds} ثانیه صبر کنید.`,
+          retryAfterSeconds: rateCheck.retryAfterSeconds,
+        });
+      }
+
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const rawCustomKey = typeof body.customApiKey === 'string' ? body.customApiKey.trim() : '';
+      if (!rawCustomKey && !verifiedUser) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            'احراز هویت انجام نشد. برای استفاده از هوش مصنوعی با سهمیه سرور، وارد حساب گوگل شوید یا کلید شخصی خود را ثبت کنید.',
+        });
+      }
+
+      const fieldError = validateTextFields([
+        { labelFa: 'دستور یا توضیحات تکمیلی', value: body.customPrompt, maxLength: MAX_PROMPT_LENGTH },
+        { labelFa: 'نام محصول', value: body.productName, maxLength: MAX_TEXT_FIELD_LENGTH },
+        { labelFa: 'مخاطب هدف', value: body.targetAudience, maxLength: MAX_TEXT_FIELD_LENGTH },
+        { labelFa: 'هدف کمپین', value: body.campaignGoal, maxLength: MAX_TEXT_FIELD_LENGTH },
+        { labelFa: 'لحن محتوا', value: body.tone, maxLength: MAX_TEXT_FIELD_LENGTH },
+        { labelFa: 'حالت اجرا', value: body.mode, maxLength: MAX_SHORT_FIELD_LENGTH },
+        { labelFa: 'حالت اتصال', value: body.connectionMode, maxLength: MAX_SHORT_FIELD_LENGTH },
+        { labelFa: 'کلید API شخصی', value: body.customApiKey, maxLength: MAX_API_KEY_LENGTH },
+      ]);
+      if (fieldError) {
+        return res.status(400).json({ ok: false, error: fieldError });
+      }
+
+      // Note: any systemInstruction field in req.body is intentionally ignored; server enforces ARKA_SYSTEM_INSTRUCTION.
       const {
         mode = 'canvas-slide',
         productName = 'پکیج جامع مالی و حسابداری آرکا',
@@ -533,8 +862,7 @@ async function startServer() {
         injectToCanvas = false,
         customApiKey = '',
         connectionMode = 'studio-creator-core',
-        systemInstruction: clientSystemInstruction = '',
-      } = req.body || {};
+      } = body;
 
       const { ai, keySource, fingerprint } = createGeminiClient(customApiKey);
       const siteContext = await getLiveArkaSiteContext(false);
@@ -618,11 +946,7 @@ async function startServer() {
           ? 'ماژول فعال: 6. Conversion Copywriting & Canvas Slide Engine (mode: "copy_engine" / /copy) — در data.copywriting: strategy، دقیقاً ۳ تیتر در headline_hooks، اسلایدهای structured_blocks، conversion_triggers و همچنین آرایه کامل canvas_slides آماده تزریق به StoryCanvas تولید کن.'
           : '';
 
-      const baseCorePrompt = clientSystemInstruction || ARKA_SYSTEM_INSTRUCTION;
-
       const systemInstruction = `${ARKA_SYSTEM_INSTRUCTION}
-
-${baseCorePrompt !== ARKA_SYSTEM_INSTRUCTION ? baseCorePrompt : ''}
 
 تمامی متن‌های فارسی باید ۱۰۰٪ به زبان فارسی سلیس، استاندارد، بدون غلط املایی و منحصراً بر اساس ویژگی‌های واقعی نرم‌افزار حسابداری آرکا (https://arka-acc.ir) شامل دموی رایگان ۱۰۰ سند، ۱ سال پشتیبانی رایگان، سرویس مستقیم سامانه مؤدیان، و ۸ سیستم تخصصی پاچال، سوله، ترخیص، منو، پروژه، ویترین، شتاب و پکیج جامع نوشته شوند.
 تلفن رسمی آرکا: 051-36079047 | وب‌سایت: arka-acc.ir | آدرس: مشهد، سید رضی ۴۰، پلاک ۲۶۵.

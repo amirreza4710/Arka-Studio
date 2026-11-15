@@ -178,6 +178,16 @@ export const getAccessToken = async (): Promise<string | null> => {
   return cachedAccessToken;
 };
 
+export const getFirebaseIdToken = async (): Promise<string | null> => {
+  const user = auth.currentUser;
+  if (!user) return null;
+  try {
+    return await user.getIdToken();
+  } catch {
+    return null;
+  }
+};
+
 export const subscribeToAuthChanges = (
   callback: (user: User | null, token: string | null) => void
 ) => {
