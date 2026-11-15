@@ -38,3 +38,111 @@
 .headline-balance {
   text-wrap: balance;
 }
+
+/* ==================== GLOBAL HIGH-CONTRAST ENTERPRISE DARK MODE (#07090E / #0F1420) ==================== */
+.arka-dark-mode {
+  background-color: #07090E !important;
+  color: #e2e8f0 !important;
+}
+
+.arka-dark-mode header.sticky {
+  background-color: #0B101B !important;
+  border-color: #1e293b !important;
+}
+
+.arka-dark-mode aside,
+.arka-dark-mode .arka-panel-card {
+  background-color: #0F1420 !important;
+  border-color: #1e293b !important;
+  color: #e2e8f0 !important;
+}
+
+.arka-dark-mode div:not([data-story-canvas="true"] *):not([data-story-canvas="true"]).bg-white,
+.arka-dark-mode section:not([data-story-canvas="true"] *).bg-white,
+.arka-dark-mode footer.border-t {
+  background-color: #0F1420 !important;
+  border-color: #1e293b !important;
+  color: #e2e8f0 !important;
+}
+
+.arka-dark-mode div:not([data-story-canvas="true"] *):not([data-story-canvas="true"]).bg-\[\#f5f8fa\],
+.arka-dark-mode pre:not([data-story-canvas="true"] *).bg-white,
+.arka-dark-mode div:not([data-story-canvas="true"] *).bg-\[\#062959\].rounded-2xl {
+  background-color: #0B101B !important;
+  border-color: #1e293b !important;
+  color: #e2e8f0 !important;
+}
+
+.arka-dark-mode button:not([data-story-canvas="true"] *).bg-\[\#f5f8fa\],
+.arka-dark-mode button:not([data-story-canvas="true"] *).bg-white {
+  background-color: #131B2E !important;
+  border-color: #243049 !important;
+  color: #e2e8f0 !important;
+}
+
+.arka-dark-mode button:not([data-story-canvas="true"] *).bg-\[\#f5f8fa\]:hover,
+.arka-dark-mode button:not([data-story-canvas="true"] *).bg-white:hover {
+  border-color: #08cdbd !important;
+}
+
+.arka-dark-mode div:not([data-story-canvas="true"] *):not([data-story-canvas="true"]).bg-\[\#e5fbf9\] {
+  background-color: rgba(8, 205, 189, 0.12) !important;
+  border-color: rgba(20, 218, 195, 0.35) !important;
+  color: #14dac3 !important;
+}
+
+.arka-dark-mode :not([data-story-canvas="true"] *) > .text-\[\#062959\],
+.arka-dark-mode h1.text-\[\#062959\],
+.arka-dark-mode h2.text-\[\#062959\],
+.arka-dark-mode h3.text-\[\#062959\],
+.arka-dark-mode label.text-\[\#062959\],
+.arka-dark-mode span.text-\[\#062959\],
+.arka-dark-mode strong.text-\[\#062959\],
+.arka-dark-mode div.text-\[\#062959\]:not([data-story-canvas="true"] *) {
+  color: #f8fafc !important;
+}
+
+.arka-dark-mode :not([data-story-canvas="true"] *) > .text-\[\#233b53\],
+.arka-dark-mode p.text-\[\#233b53\],
+.arka-dark-mode pre.text-\[\#233b53\] {
+  color: #cbd5e1 !important;
+}
+
+.arka-dark-mode :not([data-story-canvas="true"] *) > .text-\[\#7e8c9b\] {
+  color: #94a3b8 !important;
+}
+
+.arka-dark-mode :not([data-story-canvas="true"] *) > .text-\[\#089f93\] {
+  color: #14dac3 !important;
+}
+
+.arka-dark-mode input:not([data-story-canvas="true"] *),
+.arka-dark-mode select:not([data-story-canvas="true"] *),
+.arka-dark-mode textarea:not([data-story-canvas="true"] *) {
+  background-color: #07090E !important;
+  border-color: #26334D !important;
+  color: #f8fafc !important;
+}
+
+.arka-dark-mode input:not([data-story-canvas="true"] *)::placeholder,
+.arka-dark-mode textarea:not([data-story-canvas="true"] *)::placeholder {
+  color: #64748b !important;
+}
+
+.arka-dark-mode .border-\[\#e3e9ed\] {
+  border-color: #1e293b !important;
+}
+
+/* Preserve bright accent contrast on primary turquoise buttons in dark mode */
+.arka-dark-mode button.bg-\[\#08cdbd\],
+.arka-dark-mode a.bg-\[\#08cdbd\] {
+  background-color: #08cdbd !important;
+  color: #062959 !important;
+}
+
+/* Subtle turquoise + purple enterprise glow helper */
+.arka-neon-purple-ring {
+  box-shadow: 0 0 18px rgba(168, 85, 247, 0.22), 0 0 8px rgba(8, 205, 189, 0.16);
+}
+
+

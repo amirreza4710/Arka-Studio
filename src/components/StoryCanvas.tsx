@@ -87,12 +87,22 @@ export const StoryCanvas: React.FC<StoryCanvasProps> = ({
   const isPaperBg = story.theme === 'paper-navy';
   const isEmeraldBg = story.theme === 'emerald-tax';
 
+  const lastTelemetryKeyRef = useRef<string>('');
+
   useEffect(() => {
     const node = internalRef.current;
     if (!node) return;
 
+    let observerRafId = 0;
+
     const emitTelemetry = (rectW: number, rectH: number, recovered = false) => {
       if (!onCanvasMountChange) return;
+      const roundedW = Math.round(rectW);
+      const roundedH = Math.round(rectH);
+      const key = `${story.id}-${canvasWidth}-${canvasHeight}-${roundedW}-${roundedH}-${renderMode}-${recovered}`;
+      if (lastTelemetryKeyRef.current === key) return;
+      lastTelemetryKeyRef.current = key;
+
       onCanvasMountChange({
         mounted: true,
         storyId: story.id,
@@ -100,8 +110,8 @@ export const StoryCanvas: React.FC<StoryCanvasProps> = ({
         theme: story.theme,
         width: canvasWidth,
         height: canvasHeight,
-        renderedBoundsWidth: Math.round(rectW),
-        renderedBoundsHeight: Math.round(rectH),
+        renderedBoundsWidth: roundedW,
+        renderedBoundsHeight: roundedH,
         renderMode,
         renderHealth: recovered ? 'auto-recovered' : 'healthy',
       });
@@ -119,7 +129,11 @@ export const StoryCanvas: React.FC<StoryCanvasProps> = ({
         onContainerRenderFail();
         emitTelemetry(rect.width, rect.height, true);
       } else {
-        emitTelemetry(rect.width || canvasWidth, rect.height || canvasHeight, false);
+        emitTelemetry(
+          rect.width || canvasWidth,
+          rect.height || canvasHeight,
+          false
+        );
       }
     };
 
@@ -128,29 +142,33 @@ export const StoryCanvas: React.FC<StoryCanvasProps> = ({
     let resizeObserver: ResizeObserver | null = null;
     if (typeof ResizeObserver !== 'undefined') {
       resizeObserver = new ResizeObserver((entries) => {
-        for (const entry of entries) {
-          const { width, height } = entry.contentRect;
-          if (
-            renderMode === 'standard' &&
-            (width < 10 || height < 10) &&
-            onContainerRenderFail
-          ) {
-            onContainerRenderFail();
-          } else {
-            const rect = entry.target.getBoundingClientRect();
-            emitTelemetry(
-              rect.width || width || canvasWidth,
-              rect.height || height || canvasHeight,
-              false
-            );
+        if (observerRafId) cancelAnimationFrame(observerRafId);
+        observerRafId = requestAnimationFrame(() => {
+          for (const entry of entries) {
+            const { width, height } = entry.contentRect;
+            if (
+              renderMode === 'standard' &&
+              (width < 10 || height < 10) &&
+              onContainerRenderFail
+            ) {
+              onContainerRenderFail();
+            } else {
+              const rect = entry.target.getBoundingClientRect();
+              emitTelemetry(
+                rect.width || width || canvasWidth,
+                rect.height || height || canvasHeight,
+                false
+              );
+            }
           }
-        }
+        });
       });
       resizeObserver.observe(node);
     }
 
     return () => {
       cancelAnimationFrame(rafId);
+      if (observerRafId) cancelAnimationFrame(observerRafId);
       if (resizeObserver) {
         resizeObserver.disconnect();
       }
@@ -334,8 +352,15 @@ export const StoryCanvas: React.FC<StoryCanvasProps> = ({
         }}
       />
 
-      {/* Official Arka Top Accent Bar (#08cdbd to #062959) */}
-      <div className="pointer-events-none absolute top-0 inset-x-0 h-[10px] bg-gradient-to-l from-[#08cdbd] via-[#14dac3] to-[#0b2b56]" />
+      {/* Official Arka Top Accent Bar (#08cdbd to #062959 or custom theme_accent) */}
+      <div
+        className="pointer-events-none absolute top-0 inset-x-0 h-[10px]"
+        style={{
+          background: story.customAccentHex
+            ? `linear-gradient(to left, ${story.customAccentHex}, #14dac3, #0b2b56)`
+            : 'linear-gradient(to left, #08cdbd, #14dac3, #0b2b56)',
+        }}
+      />
 
       {/* Seamless Carousel Visual Continuity Connector Strip on Left Edge */}
       {isCarousel &&
@@ -417,7 +442,12 @@ export const StoryCanvas: React.FC<StoryCanvasProps> = ({
         {/* Main Headline */}
         <h1 className={`${headlineSizeClass} font-black tracking-tight headline-balance`}>
           {story.headlinePart1}{' '}
-          <span className={highlightColorClass}>{story.headlineHighlight}</span>{' '}
+          <span
+            className={highlightColorClass}
+            style={story.customAccentHex ? { color: story.customAccentHex } : undefined}
+          >
+            {story.headlineHighlight}
+          </span>{' '}
           {story.headlinePart2}
         </h1>
 

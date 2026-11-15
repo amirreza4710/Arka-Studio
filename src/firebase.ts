@@ -9,6 +9,7 @@ import {
 import {
   getFirestore,
   doc,
+  getDoc,
   getDocFromServer,
   collection,
   setDoc,
@@ -305,3 +306,56 @@ export async function deleteUserAiGeneration(genId: string): Promise<void> {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
+
+export interface UserStudioPreferences {
+  darkMode: boolean;
+  preferredConnectionMode:
+    | 'gmail-authenticated'
+    | 'custom-byok'
+    | 'studio-creator-core';
+}
+
+export async function saveUserStudioPreferences(
+  prefs: UserStudioPreferences
+): Promise<void> {
+  const currentUser = auth.currentUser;
+  if (!currentUser) return;
+
+  const path = `users/${currentUser.uid}/settings/preferences`;
+  try {
+    await setDoc(doc(db, 'users', currentUser.uid, 'settings', 'preferences'), {
+      userId: currentUser.uid,
+      darkMode: Boolean(prefs.darkMode),
+      preferredConnectionMode: prefs.preferredConnectionMode,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function fetchUserStudioPreferences(): Promise<UserStudioPreferences | null> {
+  const currentUser = auth.currentUser;
+  if (!currentUser) return null;
+
+  const path = `users/${currentUser.uid}/settings/preferences`;
+  try {
+    const snap = await getDoc(
+      doc(db, 'users', currentUser.uid, 'settings', 'preferences')
+    );
+    if (!snap.exists()) return null;
+    const data = snap.data();
+    return {
+      darkMode: Boolean(data.darkMode),
+      preferredConnectionMode:
+        data.preferredConnectionMode === 'gmail-authenticated'
+          ? 'gmail-authenticated'
+          : data.preferredConnectionMode === 'custom-byok'
+          ? 'custom-byok'
+          : 'studio-creator-core',
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+}
+

@@ -50,6 +50,17 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
+    function isValidUserSettingRecord(data, userId) {
+      return data.keys().hasAll(['userId', 'darkMode', 'preferredConnectionMode', 'updatedAt'])
+        && data.keys().hasOnly(['userId', 'darkMode', 'preferredConnectionMode', 'updatedAt'])
+        && data.userId is string
+        && data.userId == userId
+        && data.userId == request.auth.uid
+        && data.darkMode is bool
+        && data.preferredConnectionMode in ['gmail-authenticated', 'custom-byok', 'studio-creator-core']
+        && data.updatedAt is timestamp;
+    }
+
     match /users/{userId}/aiGenerations/{genId} {
       allow get: if isOwner(userId) && isValidId(userId) && isValidId(genId);
       allow list: if isOwner(userId) && existing().userId == request.auth.uid;
@@ -66,6 +77,16 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'contentJson']);
       allow delete: if isOwner(userId) && isValidId(userId) && isValidId(genId);
+    }
+
+    match /users/{userId}/settings/{settingId} {
+      allow get: if isOwner(userId) && isValidId(userId) && isValidId(settingId);
+      allow create, update: if isOwner(userId)
+        && isValidId(userId)
+        && isValidId(settingId)
+        && isValidUserSettingRecord(incoming(), userId)
+        && incoming().updatedAt == request.time;
+      allow delete: if isOwner(userId) && isValidId(userId) && isValidId(settingId);
     }
   }
 }

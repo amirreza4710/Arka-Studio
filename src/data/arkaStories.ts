@@ -93,6 +93,7 @@ export interface ArkaStoryData {
   categoryLabel: string;
   titleShort: string;
   theme: StoryThemeMode;
+  customAccentHex?: string;
   layoutType:
     | 'integration-flow'
     | 'bento-comprehensive'

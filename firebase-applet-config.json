@@ -3,6 +3,7 @@
   "appId": "1:695999127720:web:4855945015ae1eaa25a29d",
   "apiKey": "AIzaSyBU31rUmTF1bZ9jfYc134kFgWdoDDgwhzI",
   "authDomain": "active-stratum-n7cvm.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-477b1a91-56e7-4038-8d3f-ce085b681973",
   "storageBucket": "active-stratum-n7cvm.firebasestorage.app",
   "messagingSenderId": "695999127720",
   "measurementId": "",

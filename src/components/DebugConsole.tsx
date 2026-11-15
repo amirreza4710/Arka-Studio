@@ -19,7 +19,15 @@ export interface DebugLogEntry {
   id: string;
   time: string;
   level: 'ok' | 'warn' | 'error';
-  source: 'StoryCanvas' | 'Fonts' | 'Assets' | 'Server';
+  source:
+    | 'StoryCanvas'
+    | 'Fonts'
+    | 'Assets'
+    | 'Server'
+    | 'AI-Router'
+    | 'Auth'
+    | 'LiveContext'
+    | 'Workspace';
   message: string;
 }
 
@@ -43,6 +51,8 @@ interface DebugConsoleProps {
   previewScale: number;
   canvasMountEvent: StoryCanvasMountEvent | null;
   lastAssetEvent: StoryCanvasAssetEvent | null;
+  externalLogs?: DebugLogEntry[];
+  onClearExternalLogs?: () => void;
   onHardReset: () => void;
 }
 
@@ -55,6 +65,8 @@ export const DebugConsole: React.FC<DebugConsoleProps> = ({
   previewScale,
   canvasMountEvent,
   lastAssetEvent,
+  externalLogs = [],
+  onClearExternalLogs,
   onHardReset,
 }) => {
   const [isOpen, setIsOpen] = useState<boolean>(false);
@@ -558,15 +570,18 @@ export const DebugConsole: React.FC<DebugConsoleProps> = ({
           </div>
 
           {/* Live Event Log Table */}
-          <div className="rounded-xl border border-slate-800 bg-[#0B1220] overflow-hidden">
-            <div className="px-3.5 py-2 bg-[#111A2E] border-b border-slate-800 flex items-center justify-between">
+          <div className="rounded-xl border border-slate-800 bg-[#07090E] overflow-hidden">
+            <div className="px-3.5 py-2 bg-[#0F1420] border-b border-slate-800 flex items-center justify-between">
               <span className="text-[11px] font-bold text-slate-300">
-                لاگ رویدادهای مونت StoryCanvas، وضعیت document.fonts و منابع تصویر ({logs.length})
+                لاگ رویدادهای AI Router، اعتبارسنجی کلید، کش سایت و StoryCanvas ({externalLogs.length + logs.length})
               </span>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setLogs([])}
+                  onClick={() => {
+                    setLogs([]);
+                    onClearExternalLogs?.();
+                  }}
                   className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-white cursor-pointer"
                 >
                   <Trash2 className="w-3 h-3" />
@@ -585,13 +600,13 @@ export const DebugConsole: React.FC<DebugConsoleProps> = ({
               </div>
             </div>
 
-            <div className="max-h-48 overflow-y-auto divide-y divide-slate-800/70 text-xs">
-              {logs.length === 0 ? (
+            <div className="max-h-56 overflow-y-auto divide-y divide-slate-800/70 text-xs">
+              {externalLogs.length + logs.length === 0 ? (
                 <div className="p-4 text-center text-slate-500">
                   هنوز لاگی ثبت نشده است. روی «بررسی مجدد منابع» کلیک کنید.
                 </div>
               ) : (
-                logs.map((entry) => (
+                [...externalLogs, ...logs].slice(0, 80).map((entry) => (
                   <div
                     key={entry.id}
                     className="px-3.5 py-2 flex items-start gap-3 hover:bg-white/[0.02]"
@@ -608,6 +623,10 @@ export const DebugConsole: React.FC<DebugConsoleProps> = ({
                           ? 'text-rose-400'
                           : entry.level === 'warn'
                           ? 'text-amber-400'
+                          : entry.source === 'AI-Router'
+                          ? 'text-purple-400'
+                          : entry.source === 'LiveContext'
+                          ? 'text-cyan-400'
                           : 'text-emerald-400'
                       }`}
                     >

@@ -31,14 +31,24 @@ import {
   CarouselSlideMeta,
 } from './components/StoryCanvas';
 import { StoryEditorPanel } from './components/StoryEditorPanel';
-import { ArkaAIStudioPanel } from './components/ArkaAIStudioPanel';
+import {
+  ArkaAIStudioPanel,
+  CustomKeyVerifiedInfo,
+} from './components/ArkaAIStudioPanel';
 import { GoogleWorkspacePanel } from './components/GoogleWorkspacePanel';
-import { DebugConsole } from './components/DebugConsole';
+import { DebugConsole, DebugLogEntry } from './components/DebugConsole';
 import {
   initAuth,
   signInWithGmail,
   signOutGmail,
+  saveUserStudioPreferences,
+  fetchUserStudioPreferences,
+  getAccessToken,
 } from './firebase';
+import {
+  ArkaConnectionSource,
+  CanvasSlideSchemaItem,
+} from './config/arkaCore';
 import {
   Download,
   ChevronRight,
@@ -62,11 +72,21 @@ import {
   Eye,
   LogOut,
   FileSpreadsheet,
+  Moon,
+  Sun,
+  KeyRound,
+  ShieldCheck,
+  ShieldAlert,
+  AlertCircle,
+  X,
+  Trash2,
+  ExternalLink,
 } from 'lucide-react';
 
 const STORAGE_KEY = 'arka_story_studio_v2';
 const CAROUSEL_STORAGE_KEY = 'arka_carousel_decks_v2';
 const ACTIVE_CONFIG_STORAGE_KEY = 'arka_story_active_config_v2';
+const CUSTOM_BYOK_STORAGE_KEY = 'arka_custom_byok_v1';
 
 type MobileTabId = 'preview' | 'ai-studio' | 'editor' | 'workspace' | 'gallery';
 type DesktopSidePanelMode = 'ai-studio' | 'editor' | 'workspace';
@@ -239,11 +259,34 @@ export default function App() {
     null
   );
 
-  // Real-time StoryCanvas mount & image asset telemetry for DebugConsole
+  // Real-time StoryCanvas mount, AI Router, Auth, LiveContext & Workspace telemetry for DebugConsole
   const [canvasMountEvent, setCanvasMountEvent] =
     useState<StoryCanvasMountEvent | null>(null);
   const [lastAssetEvent, setLastAssetEvent] =
     useState<StoryCanvasAssetEvent | null>(null);
+  const [telemetryLogs, setTelemetryLogs] = useState<DebugLogEntry[]>([]);
+
+  const emitTelemetryLog = React.useCallback(
+    (
+      level: DebugLogEntry['level'],
+      source: DebugLogEntry['source'],
+      message: string
+    ) => {
+      const now = new Date();
+      const timeStr = now.toTimeString().split(' ')[0];
+      setTelemetryLogs((prev) => [
+        {
+          id: `tel-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          time: timeStr,
+          level,
+          source,
+          message,
+        },
+        ...prev.slice(0, 49),
+      ]);
+    },
+    []
+  );
 
   // Dedicated 1:1 exact-pixel export ref for PNG generation
   const exportCanvasRef = useRef<HTMLDivElement | null>(null);
@@ -253,18 +296,126 @@ export default function App() {
     ...customPresets,
   ];
 
-  // Initialize Firebase Auth & Workspace Token state
+  // Global High-Contrast Dark Mode (Default: true) & AI Connection Mode Preferences
+  const [darkMode, setDarkMode] = useState<boolean>(() => {
+    try {
+      const savedConfig = localStorage.getItem(ACTIVE_CONFIG_STORAGE_KEY);
+      if (savedConfig) {
+        const parsed = JSON.parse(savedConfig);
+        if (
+          parsed.darkModeVersion === 2 &&
+          typeof parsed.darkMode === 'boolean'
+        ) {
+          return parsed.darkMode;
+        }
+      }
+    } catch {
+      // Ignore
+    }
+    return true;
+  });
+
+  const [preferredConnectionMode, setPreferredConnectionMode] =
+    useState<ArkaConnectionSource>(() => {
+      try {
+        const savedConfig = localStorage.getItem(ACTIVE_CONFIG_STORAGE_KEY);
+        if (savedConfig) {
+          const parsed = JSON.parse(savedConfig);
+          if (parsed.preferredConnectionMode === 'gmail-authenticated') {
+            return 'gmail-authenticated';
+          }
+          if (parsed.preferredConnectionMode === 'custom-byok') {
+            return 'custom-byok';
+          }
+        }
+      } catch {
+        // Ignore
+      }
+      return 'studio-creator-core';
+    });
+
+  // Custom BYOK (Bring Your Own Key) state stored strictly in browser localStorage (never Firestore)
+  const [customApiKey, setCustomApiKey] = useState<string>(() => {
+    try {
+      const raw = localStorage.getItem(CUSTOM_BYOK_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        return String(parsed.key || '');
+      }
+    } catch {
+      // Ignore
+    }
+    return '';
+  });
+
+  const [customKeyVerifiedInfo, setCustomKeyVerifiedInfo] =
+    useState<CustomKeyVerifiedInfo | null>(() => {
+      try {
+        const raw = localStorage.getItem(CUSTOM_BYOK_STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed.verifiedInfo?.valid) {
+            return parsed.verifiedInfo;
+          }
+        }
+      } catch {
+        // Ignore
+      }
+      return null;
+    });
+
+  // Auth & API Key Management Modal State
+  const [isAuthKeyModalOpen, setIsAuthKeyModalOpen] = useState<boolean>(false);
+  const [byokDraftInput, setByokDraftInput] = useState<string>(customApiKey);
+  const [isTestingByok, setIsTestingByok] = useState<boolean>(false);
+  const [byokVerifyError, setByokVerifyError] = useState<string | null>(null);
+  const [byokDraftVerifiedInfo, setByokDraftVerifiedInfo] =
+    useState<CustomKeyVerifiedInfo | null>(customKeyVerifiedInfo);
+
+  // Explicit User Confirmation Modal for Workspace Write Actions (Drive PNG / Sheets Write)
+  const [workspaceConfirmModal, setWorkspaceConfirmModal] = useState<{
+    title: string;
+    description: string;
+    confirmLabel: string;
+    onConfirm: () => Promise<void>;
+  } | null>(null);
+  const [isExecutingWorkspaceConfirm, setIsExecutingWorkspaceConfirm] =
+    useState<boolean>(false);
+
+  // Initialize Firebase Auth & Workspace Token state + load cloud preferences
   useEffect(() => {
     const unsub = initAuth(
       (user, token) => {
         setCurrentUser(user);
         setAccessToken(token);
         setNeedsAuth(false);
+        fetchUserStudioPreferences()
+          .then((prefs) => {
+            if (prefs) {
+              setDarkMode(prefs.darkMode);
+              setPreferredConnectionMode(prefs.preferredConnectionMode);
+            }
+          })
+          .catch(() => {
+            // Ignore
+          });
       },
       (user) => {
         setCurrentUser(user);
         setAccessToken(null);
         setNeedsAuth(true);
+        if (user) {
+          fetchUserStudioPreferences()
+            .then((prefs) => {
+              if (prefs) {
+                setDarkMode(prefs.darkMode);
+                setPreferredConnectionMode(prefs.preferredConnectionMode);
+              }
+            })
+            .catch(() => {
+              // Ignore
+            });
+        }
       }
     );
     return () => unsub();
@@ -275,6 +426,8 @@ export default function App() {
     if (!autoFitScale) return;
 
     const node = stageContainerRef.current;
+    let rafId = 0;
+
     const computeScale = (containerWidth: number) => {
       if (containerWidth <= 0) return;
       const horizontalPadding = containerWidth < 640 ? 32 : 64;
@@ -291,18 +444,25 @@ export default function App() {
         Math.max(0.28, heightScale)
       ).toFixed(2);
 
-      setPreviewScale(Math.max(0.22, Math.min(0.65, optimalScale)));
+      const clamped = Math.max(0.22, Math.min(0.65, optimalScale));
+      setPreviewScale((prev) => (Math.abs(prev - clamped) >= 0.01 ? clamped : prev));
     };
 
     if (node && typeof ResizeObserver !== 'undefined') {
       const observer = new ResizeObserver((entries) => {
-        for (const entry of entries) {
-          computeScale(entry.contentRect.width);
-        }
+        if (rafId) cancelAnimationFrame(rafId);
+        rafId = requestAnimationFrame(() => {
+          for (const entry of entries) {
+            computeScale(entry.contentRect.width);
+          }
+        });
       });
       observer.observe(node);
       computeScale(node.getBoundingClientRect().width || window.innerWidth);
-      return () => observer.disconnect();
+      return () => {
+        if (rafId) cancelAnimationFrame(rafId);
+        observer.disconnect();
+      };
     } else {
       computeScale(window.innerWidth);
     }
@@ -342,12 +502,149 @@ export default function App() {
           logoMode,
           customLogoUrl,
           logoScale,
+          darkMode,
+          darkModeVersion: 2,
+          preferredConnectionMode,
         })
       );
     } catch {
       // Ignore storage quota errors
     }
-  }, [activePresetId, activeFormatId, logoMode, customLogoUrl, logoScale]);
+  }, [
+    activePresetId,
+    activeFormatId,
+    logoMode,
+    customLogoUrl,
+    logoScale,
+    darkMode,
+    preferredConnectionMode,
+  ]);
+
+  const handleToggleDarkMode = () => {
+    setDarkMode((prev) => {
+      const next = !prev;
+      if (currentUser) {
+        saveUserStudioPreferences({
+          darkMode: next,
+          preferredConnectionMode,
+        }).catch(() => {
+          // Ignore
+        });
+      }
+      return next;
+    });
+  };
+
+  const handleChangeConnectionMode = (nextMode: ArkaConnectionSource) => {
+    setPreferredConnectionMode(nextMode);
+    emitTelemetryLog(
+      'ok',
+      'Auth',
+      `منبع اعتبار هوش مصنوعی تغییر یافت به: ${
+        nextMode === 'custom-byok'
+          ? 'کلید API شخصی (BYOK)'
+          : nextMode === 'gmail-authenticated'
+          ? 'اکانت جیمیل کاربر'
+          : 'هسته سازمانی استودیو آرکا'
+      }`
+    );
+    if (currentUser) {
+      saveUserStudioPreferences({
+        darkMode,
+        preferredConnectionMode: nextMode,
+      }).catch(() => {
+        // Ignore
+      });
+    }
+  };
+
+  const handleTestCustomByokKey = async () => {
+    const trimmed = byokDraftInput.trim();
+    if (!trimmed) {
+      setByokVerifyError('لطفاً کلید Gemini API Key را وارد کنید.');
+      return;
+    }
+    setIsTestingByok(true);
+    setByokVerifyError(null);
+    try {
+      const resp = await fetch('/api/arka-ai/verify-key', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          customApiKey: trimmed,
+          provider: 'gemini',
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data?.ok || !data?.valid) {
+        throw new Error(
+          data?.error || 'اعتبارسنجی کلید ناموفق بود. کلید را بررسی کنید.'
+        );
+      }
+
+      const info: CustomKeyVerifiedInfo = {
+        valid: true,
+        models: Array.isArray(data.models) ? data.models : [],
+        hasPro: Boolean(data.hasPro),
+        hasFlash: Boolean(data.hasFlash),
+        checkedAt: data.checkedAt || 'الان',
+      };
+      setByokDraftVerifiedInfo(info);
+      emitTelemetryLog(
+        'ok',
+        'Auth',
+        `کلید API شخصی تایید شد (${data.latencyMs || 0}ms) · مدل‌های مجاز: ${info.models.slice(0, 4).join(', ')}`
+      );
+    } catch (err: any) {
+      const msg = err?.message || 'خطا در اعتبارسنجی کلید API.';
+      setByokDraftVerifiedInfo(null);
+      setByokVerifyError(msg);
+      emitTelemetryLog('error', 'Auth', `اعتبارسنجی کلید ناموفق: ${msg}`);
+    } finally {
+      setIsTestingByok(false);
+    }
+  };
+
+  const handleSaveVerifiedByokKey = () => {
+    const trimmed = byokDraftInput.trim();
+    if (!trimmed || !byokDraftVerifiedInfo?.valid) return;
+    setCustomApiKey(trimmed);
+    setCustomKeyVerifiedInfo(byokDraftVerifiedInfo);
+    try {
+      localStorage.setItem(
+        CUSTOM_BYOK_STORAGE_KEY,
+        JSON.stringify({
+          key: trimmed,
+          verifiedInfo: byokDraftVerifiedInfo,
+        })
+      );
+    } catch {
+      // Ignore
+    }
+    handleChangeConnectionMode('custom-byok');
+    setIsAuthKeyModalOpen(false);
+    setExportStatusMessage(
+      'کلید API شخصی شما با موفقیت ذخیره و به عنوان منبع فعال انتخاب شد.'
+    );
+    setTimeout(() => setExportStatusMessage(null), 3500);
+  };
+
+  const handleClearCustomByokKey = () => {
+    setCustomApiKey('');
+    setCustomKeyVerifiedInfo(null);
+    setByokDraftInput('');
+    setByokDraftVerifiedInfo(null);
+    setByokVerifyError(null);
+    try {
+      localStorage.removeItem(CUSTOM_BYOK_STORAGE_KEY);
+    } catch {
+      // Ignore
+    }
+    handleChangeConnectionMode(
+      currentUser && !needsAuth ? 'gmail-authenticated' : 'studio-creator-core'
+    );
+    emitTelemetryLog('warn', 'Auth', 'کلید API شخصی پاک شد و منبع به حالت پیش‌فرض بازگشت.');
+  };
 
   const handleGoogleSignIn = async () => {
     if (isSigningIn) return;
@@ -364,6 +661,11 @@ export default function App() {
       setCurrentUser(result.user);
       setAccessToken(result.accessToken || null);
       setNeedsAuth(!result.accessToken);
+      emitTelemetryLog(
+        'ok',
+        'Auth',
+        `ورود موفق با حساب گوگل (${result.user.email}) · دسترسی Drive و Sheets فعال شد.`
+      );
       setExportStatusMessage(
         `خوش آمدید ${result.user.displayName || result.user.email}! دسترسی Google Sheets، Google Drive و هوش مصنوعی آرکا فعال شد.`
       );
@@ -383,6 +685,7 @@ export default function App() {
     setCurrentUser(null);
     setAccessToken(null);
     setNeedsAuth(true);
+    emitTelemetryLog('warn', 'Auth', 'خروج از حساب گوگل انجام شد.');
     setExportStatusMessage('از حساب گوگل خارج شدید.');
     setTimeout(() => setExportStatusMessage(null), 2500);
   };
@@ -506,8 +809,94 @@ export default function App() {
       setCustomAiCaption(captionText);
     }
     setMobileTab('preview');
+    emitTelemetryLog(
+      'ok',
+      'StoryCanvas',
+      `اسلاید تولیدشده با هوش مصنوعی روی بوم اعمال شد: «${updated.headlineHighlight}»`
+    );
     setExportStatusMessage(
       'محتوای تولیدشده توسط هوش مصنوعی آرکا مستقیماً روی بوم طراحی اعمال شد!'
+    );
+    setTimeout(() => setExportStatusMessage(null), 3500);
+  };
+
+  // Inject Enterprise 6-Module canvas_slides item directly into StoryCanvas (auto-adapting aspect ratio 9:16 | 4:5 | 1:1)
+  const handleInjectCanvasSlideItem = (
+    slide: CanvasSlideSchemaItem,
+    targetAspectRatio?: string,
+    captionText?: string
+  ) => {
+    if (targetAspectRatio) {
+      const targetFmtId: CanvasFormatId =
+        targetAspectRatio === '4:5'
+          ? 'post-4-5'
+          : targetAspectRatio === '1:1'
+          ? 'post-1-1'
+          : 'story-9-16';
+      const targetFmt = CANVAS_FORMATS.find((f) => f.id === targetFmtId);
+      if (targetFmt && targetFmt.id !== activeFormatId) {
+        handleSelectFormat(targetFmt);
+      }
+    }
+
+    const words = (slide.headline || '').trim().split(/\s+/).filter(Boolean);
+    const splitPoint = Math.max(1, Math.floor(words.length / 2));
+    const part1 = words.slice(0, splitPoint).join(' ');
+    const highlight = words.slice(splitPoint, splitPoint + 2).join(' ') || slide.badge_text || 'آرکا';
+    const part2 = words.slice(splitPoint + 2).join(' ');
+
+    const bullets = Array.isArray(slide.bullet_points)
+      ? slide.bullet_points
+      : [];
+
+    const mappedItems = activeStory.items.map((existing, idx) => {
+      const bp = bullets[idx];
+      if (!bp) return existing;
+      return {
+        ...existing,
+        kicker: `۰${idx + 1} · ${slide.badge_text || 'مزیت کلیدی آرکا'}`,
+        title: bp,
+        subtitle:
+          idx === 0
+            ? slide.subheadline || existing.subtitle
+            : 'هسته یکپارچه نرم‌افزار حسابداری آرکا (arka-acc.ir)',
+        metric: 'آرکا',
+      };
+    });
+
+    const updated: ArkaStoryData = {
+      ...activeStory,
+      categoryLabel: slide.badge_text || activeStory.categoryLabel,
+      headerMeta: 'تولیدشده با هسته ۶ ماژوله آرکا · arka-acc.ir',
+      eyebrow: slide.badge_text || activeStory.eyebrow,
+      headlinePart1: part1,
+      headlineHighlight: highlight,
+      headlinePart2: part2,
+      leadCopy: slide.subheadline || activeStory.leadCopy,
+      primaryStatValue: bullets[0] || activeStory.primaryStatValue,
+      primaryStatLabel:
+        slide.footer_cta || 'تست رایگان ۱۰۰ سند در https://arka-acc.ir/demo',
+      customAccentHex: slide.theme_accent || undefined,
+      items: mappedItems,
+      stickerGuide: {
+        ...activeStory.stickerGuide,
+        stickerTitle: slide.footer_cta || activeStory.stickerGuide.stickerTitle,
+        stickerActionText: 'https://arka-acc.ir/demo',
+      },
+    };
+
+    handleUpdateStory(updated);
+    if (captionText) {
+      setCustomAiCaption(captionText);
+    }
+    setMobileTab('preview');
+    emitTelemetryLog(
+      'ok',
+      'StoryCanvas',
+      `اسلاید #${slide.slide_number} («${slide.headline}») با سایز ${targetAspectRatio || activeFormat.ratioLabel} به بوم تزریق شد.`
+    );
+    setExportStatusMessage(
+      `اسلاید «${slide.badge_text || slide.headline}» مستقیماً روی بوم StoryCanvas رندر شد!`
     );
     setTimeout(() => setExportStatusMessage(null), 3500);
   };
@@ -524,6 +913,166 @@ export default function App() {
       `کاروسل هوشمند «${newDeck.title}» (${newDeck.slides.length} اسلاید پیوسته) در استودیو بارگذاری شد!`
     );
     setTimeout(() => setExportStatusMessage(null), 4000);
+  };
+
+  // Direct Google Drive PNG upload & Google Sheets structured export (explicit confirmation required)
+  const handleRequestSaveCanvasPngToDrive = async () => {
+    const token = accessToken || (await getAccessToken());
+    if (!token || needsAuth) {
+      await handleGoogleSignIn();
+      return;
+    }
+
+    setWorkspaceConfirmModal({
+      title: 'تایید آپلود تصویر PNG بوم در Google Drive',
+      description: `آیا مایل هستید تصویر PNG بوم فعلی («${activeStory.titleShort}» با ابعاد ${activeFormat.width}×${activeFormat.height}) مستقیماً در حساب Google Drive شما ذخیره شود؟`,
+      confirmLabel: 'بله، آپلود PNG در Google Drive',
+      onConfirm: async () => {
+        const activeTok = accessToken || (await getAccessToken());
+        if (!activeTok) return;
+        const dataUrl = await renderActiveCanvasToPngDataUrl();
+        if (!dataUrl) {
+          throw new Error('امکان رندر تصویر PNG از بوم وجود نداشت.');
+        }
+
+        const base64Data = dataUrl.split(',')[1];
+        const fileName = `arka-${activeFormat.id}-${activeStory.order}-${activeFormat.width}x${activeFormat.height}.png`;
+        const metadata = {
+          name: fileName,
+          mimeType: 'image/png',
+          description: `تولیدشده در استودیو هوشمند آرکا (https://arka-acc.ir) - ${activeStory.titleShort}`,
+        };
+
+        const boundary = '-------ArkaStudioDriveBoundary314159';
+        const delimiter = `\r\n--${boundary}\r\n`;
+        const closeDelim = `\r\n--${boundary}--`;
+
+        const multipartBody =
+          delimiter +
+          'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+          JSON.stringify(metadata) +
+          delimiter +
+          'Content-Type: image/png\r\n' +
+          'Content-Transfer-Encoding: base64\r\n\r\n' +
+          base64Data +
+          closeDelim;
+
+        const uploadRes = await fetch(
+          'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink',
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${activeTok}`,
+              'Content-Type': `multipart/related; boundary=${boundary}`,
+            },
+            body: multipartBody,
+          }
+        );
+
+        if (!uploadRes.ok) {
+          throw new Error('خطا در آپلود تصویر PNG به Google Drive.');
+        }
+
+        emitTelemetryLog(
+          'ok',
+          'Workspace',
+          `تصویر PNG بوم (${fileName}) با موفقیت در Google Drive ذخیره شد.`
+        );
+        setExportStatusMessage(
+          `تصویر PNG بوم فعلی (${fileName}) مستقیماً در Google Drive شما ذخیره شد!`
+        );
+        setTimeout(() => setExportStatusMessage(null), 4000);
+      },
+    });
+  };
+
+  const handleRequestWriteStructuredToSheet = async (params: {
+    title: string;
+    tabName: string;
+    headers: string[];
+    rows: string[][];
+  }) => {
+    const token = accessToken || (await getAccessToken());
+    if (!token || needsAuth) {
+      await handleGoogleSignIn();
+      return;
+    }
+
+    setWorkspaceConfirmModal({
+      title: 'تایید ثبت جدول در Google Sheets',
+      description: `آیا مایل هستید فایل جدول «${params.title}» شامل ${params.rows.length} ردیف در حساب Google Sheets / Drive شما ایجاد و ذخیره شود؟`,
+      confirmLabel: 'بله، ساخت و ثبت در Google Sheets',
+      onConfirm: async () => {
+        const activeTok = accessToken || (await getAccessToken());
+        if (!activeTok) return;
+
+        const createRes = await fetch(
+          'https://sheets.googleapis.com/v4/spreadsheets',
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${activeTok}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              properties: { title: params.title },
+              sheets: [
+                {
+                  properties: {
+                    title: params.tabName,
+                    rightToLeft: true,
+                  },
+                },
+              ],
+            }),
+          }
+        );
+
+        if (!createRes.ok) {
+          throw new Error('خطا در ایجاد فایل Google Sheets.');
+        }
+
+        const createdSheet = await createRes.json();
+        const spreadsheetId = createdSheet.spreadsheetId;
+        const actualTabTitle =
+          createdSheet.sheets?.[0]?.properties?.title || params.tabName;
+
+        const lastColChar = String.fromCharCode(
+          64 + Math.min(26, Math.max(1, params.headers.length))
+        );
+        const encodedRange = encodeURIComponent(
+          `'${actualTabTitle}'!A1:${lastColChar}${params.rows.length + 1}`
+        );
+
+        const writeRes = await fetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodedRange}?valueInputOption=USER_ENTERED`,
+          {
+            method: 'PUT',
+            headers: {
+              Authorization: `Bearer ${activeTok}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              values: [params.headers, ...params.rows],
+            }),
+          }
+        );
+
+        if (!writeRes.ok) {
+          throw new Error('فایل ساخته شد اما نوشتن ردیف‌ها با خطا مواجه شد.');
+        }
+
+        emitTelemetryLog(
+          'ok',
+          'Workspace',
+          `جدول «${params.title}» (${params.rows.length} ردیف) در Google Sheets ثبت شد.`
+        );
+        setExportStatusMessage(
+          `جدول «${params.title}» با موفقیت در Google Sheets و Drive شما ذخیره شد!`
+        );
+        setTimeout(() => setExportStatusMessage(null), 4500);
+      },
+    });
   };
 
   const handleSelectPreset = (preset: CampaignPreset) => {
@@ -839,7 +1388,9 @@ export default function App() {
   return (
     <div
       dir="rtl"
-      className="min-h-screen bg-[#f5f8fa] text-[#233b53] flex flex-col pb-20 lg:pb-0"
+      className={`min-h-screen bg-[#f5f8fa] text-[#233b53] flex flex-col pb-20 lg:pb-0 transition-colors ${
+        darkMode ? 'arka-dark-mode' : ''
+      }`}
     >
       {/* ==================== STRICT 3-ZONE TOP BAR CONTRACT (ARKA-ACC.IR THEME) ==================== */}
       <header className="flex items-center justify-between gap-4 lg:gap-8 px-4 sm:px-6 py-3 border-b border-[#0b2b56] bg-[#062959] text-white sticky top-0 z-40 shadow-md">
@@ -949,6 +1500,66 @@ export default function App() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {/* Global Dark Mode Theme Toggle Button */}
+            <button
+              type="button"
+              onClick={handleToggleDarkMode}
+              className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-black transition-all cursor-pointer whitespace-nowrap shrink-0 min-h-[40px] ${
+                darkMode
+                  ? 'bg-[#0F1420] text-[#14dac3] border-[#14dac3]/60 shadow-[0_0_12px_rgba(20,218,195,0.28)]'
+                  : 'bg-white text-[#062959] border-[#e3e9ed] hover:border-[#08cdbd]'
+              }`}
+              title="تغییر تم سراسری استودیو (حالت تیره / حالت روشن)"
+            >
+              {darkMode ? (
+                <>
+                  <Sun className="w-4 h-4 text-amber-300" />
+                  <span>تم تیره: فعال</span>
+                </>
+              ) : (
+                <>
+                  <Moon className="w-4 h-4 text-[#062959]" />
+                  <span>تم شب (Dark)</span>
+                </>
+              )}
+            </button>
+
+            {/* Credit Source & Custom API Key (BYOK) Management Modal Trigger */}
+            <button
+              type="button"
+              onClick={() => {
+                setByokDraftInput(customApiKey);
+                setByokDraftVerifiedInfo(customKeyVerifiedInfo);
+                setByokVerifyError(null);
+                setIsAuthKeyModalOpen(true);
+              }}
+              className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-black transition-all cursor-pointer whitespace-nowrap shrink-0 min-h-[40px] ${
+                customApiKey &&
+                customKeyVerifiedInfo?.valid &&
+                preferredConnectionMode === 'custom-byok'
+                  ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/50'
+                  : currentUser &&
+                    !needsAuth &&
+                    preferredConnectionMode === 'gmail-authenticated'
+                  ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/50'
+                  : 'bg-purple-500/15 text-purple-300 border-purple-500/50'
+              }`}
+              title="مدیریت اعتبار هوش مصنوعی و تست زنده کلید API شخصی (BYOK)"
+            >
+              <KeyRound className="w-4 h-4 shrink-0" />
+              <span>
+                {customApiKey &&
+                customKeyVerifiedInfo?.valid &&
+                preferredConnectionMode === 'custom-byok'
+                  ? '🔵 کلید شخصی (BYOK)'
+                  : currentUser &&
+                    !needsAuth &&
+                    preferredConnectionMode === 'gmail-authenticated'
+                  ? '🟢 اکانت جیمیل'
+                  : '🟠 مدیریت اعتبار و API Key'}
+              </span>
+            </button>
+
             {/* Official Sign in with Google Button or Active Account */}
             {currentUser && !needsAuth ? (
               <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white border border-[#08cdbd] text-xs font-bold text-[#062959]">
@@ -1420,6 +2031,8 @@ export default function App() {
                 previewScale={previewScale}
                 canvasMountEvent={canvasMountEvent}
                 lastAssetEvent={lastAssetEvent}
+                externalLogs={telemetryLogs}
+                onClearExternalLogs={() => setTelemetryLogs([])}
                 onHardReset={handleResetAllStories}
               />
             </div>
@@ -1485,7 +2098,21 @@ export default function App() {
                   onGoogleSignOut={handleGoogleSignOut}
                   activeStory={activeStory}
                   onInjectSlideIntoCanvas={handleInjectAiSlideIntoCanvas}
+                  onInjectCanvasSlideItem={handleInjectCanvasSlideItem}
                   onInjectCarouselDeckIntoStudio={handleInjectAiCarouselDeck}
+                  onSaveCanvasPngToDrive={handleRequestSaveCanvasPngToDrive}
+                  onWriteStructuredToSheet={handleRequestWriteStructuredToSheet}
+                  preferredConnectionMode={preferredConnectionMode}
+                  onChangeConnectionMode={handleChangeConnectionMode}
+                  customApiKey={customApiKey}
+                  customKeyVerifiedInfo={customKeyVerifiedInfo}
+                  onOpenAuthKeyModal={() => {
+                    setByokDraftInput(customApiKey);
+                    setByokDraftVerifiedInfo(customKeyVerifiedInfo);
+                    setByokVerifyError(null);
+                    setIsAuthKeyModalOpen(true);
+                  }}
+                  onEmitTelemetryLog={emitTelemetryLog}
                   onCalendarSavedToDrive={(info) => {
                     setExportStatusMessage(
                       `تقویم ۳۰ روزه «${info.title}» با موفقیت به‌عنوان فایل Spreadsheet در Google Drive ذخیره شد!`
@@ -1779,6 +2406,249 @@ export default function App() {
           showStickerPlaceholder={showStickerPlaceholder}
         />
       </div>
+
+      {/* ==================== DUAL AUTH & BYOK API KEY MANAGEMENT MODAL ==================== */}
+      {isAuthKeyModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-[#0F1420] border border-slate-700 rounded-2xl max-w-lg w-full p-5 shadow-2xl space-y-4 text-right text-slate-100">
+            <div className="flex items-center justify-between gap-2 pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-xl bg-purple-500/20 border border-purple-500/40 text-purple-300 flex items-center justify-center shrink-0">
+                  <KeyRound className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-black text-white">
+                    مدیریت اعتبار هوش مصنوعی، کلید شخصی (BYOK) و حساب گوگل
+                  </h3>
+                  <p className="text-[11px] text-slate-400">
+                    صحت‌سنجی زنده لیست مدل‌ها (ai.models.list) پیش از ذخیره
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsAuthKeyModalOpen(false)}
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Active Source Selector Cards */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+              <button
+                type="button"
+                onClick={() => {
+                  if (!currentUser || needsAuth) {
+                    handleGoogleSignIn();
+                  } else {
+                    handleChangeConnectionMode('gmail-authenticated');
+                  }
+                }}
+                className={`p-3 rounded-xl border text-right cursor-pointer transition-all ${
+                  currentUser &&
+                  !needsAuth &&
+                  preferredConnectionMode === 'gmail-authenticated'
+                    ? 'bg-emerald-500/15 border-emerald-400 text-white'
+                    : 'bg-[#07090E] border-slate-800 text-slate-300 hover:border-emerald-500/40'
+                }`}
+              >
+                <div className="font-black text-emerald-300">
+                  🟢 حالت ۱: اکانت جیمیل
+                </div>
+                <div className="text-[10px] text-slate-400 mt-1">
+                  {currentUser && !needsAuth
+                    ? `${currentUser.email} (Drive + Sheets فعال)`
+                    : 'اتصال به Google Drive و Sheets'}
+                </div>
+              </button>
+
+              <button
+                type="button"
+                disabled={!customApiKey || !customKeyVerifiedInfo?.valid}
+                onClick={() => handleChangeConnectionMode('custom-byok')}
+                className={`p-3 rounded-xl border text-right cursor-pointer transition-all disabled:opacity-50 ${
+                  customApiKey &&
+                  customKeyVerifiedInfo?.valid &&
+                  preferredConnectionMode === 'custom-byok'
+                    ? 'bg-cyan-500/15 border-cyan-400 text-white'
+                    : 'bg-[#07090E] border-slate-800 text-slate-300 hover:border-cyan-500/40'
+                }`}
+              >
+                <div className="font-black text-cyan-300">
+                  🔵 حالت ۲: کلید شخصی
+                </div>
+                <div className="text-[10px] text-slate-400 mt-1">
+                  {customApiKey && customKeyVerifiedInfo?.valid
+                    ? 'کلید شخصی تاییدشده آماده اجرا'
+                    : 'ابتدا کلید را پایین تست و ذخیره کنید'}
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() =>
+                  handleChangeConnectionMode('studio-creator-core')
+                }
+                className={`p-3 rounded-xl border text-right cursor-pointer transition-all ${
+                  preferredConnectionMode === 'studio-creator-core'
+                    ? 'bg-amber-500/15 border-amber-400 text-white'
+                    : 'bg-[#07090E] border-slate-800 text-slate-300 hover:border-amber-500/40'
+                }`}
+              >
+                <div className="font-black text-amber-300">
+                  🟠 کلید سازمانی آرکا
+                </div>
+                <div className="text-[10px] text-slate-400 mt-1">
+                  سرویس پیش‌فرض سرور استودیو آرکا
+                </div>
+              </button>
+            </div>
+
+            {/* Custom Gemini API Key BYOK Input + Live Test */}
+            <div className="p-4 rounded-xl bg-[#07090E] border border-slate-800 space-y-3">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-black text-[#14dac3]">
+                  ورود کلید API شخصی (Google Gemini API Key)
+                </label>
+                {customApiKey && (
+                  <button
+                    type="button"
+                    onClick={handleClearCustomByokKey}
+                    className="inline-flex items-center gap-1 text-[11px] text-rose-400 hover:text-rose-300 cursor-pointer"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    <span>حذف کلید ذخیره‌شده</span>
+                  </button>
+                )}
+              </div>
+
+              <input
+                type="password"
+                dir="ltr"
+                value={byokDraftInput}
+                onChange={(e) => {
+                  setByokDraftInput(e.target.value);
+                  setByokDraftVerifiedInfo(null);
+                  setByokVerifyError(null);
+                }}
+                placeholder="AIzaSy..."
+                className="w-full bg-[#0F1420] border border-slate-700 focus:border-[#08cdbd] rounded-xl px-3 py-2.5 text-xs font-mono text-white outline-none text-left"
+              />
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={isTestingByok}
+                  onClick={handleTestCustomByokKey}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-60 text-white text-xs font-black cursor-pointer"
+                >
+                  {isTestingByok ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <ShieldCheck className="w-4 h-4" />
+                  )}
+                  <span>
+                    {isTestingByok
+                      ? 'در حال استعلام از Gemini...'
+                      : 'تست و اعتبارسنجی کلید'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={!byokDraftVerifiedInfo?.valid}
+                  onClick={handleSaveVerifiedByokKey}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#08cdbd] hover:bg-[#14dac3] disabled:opacity-40 text-[#062959] text-xs font-black cursor-pointer"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>ذخیره و فعال‌سازی کلید</span>
+                </button>
+              </div>
+
+              {byokVerifyError && (
+                <div className="p-2.5 rounded-xl bg-rose-500/10 border border-rose-500/40 text-rose-300 text-xs flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{byokVerifyError}</span>
+                </div>
+              )}
+
+              {byokDraftVerifiedInfo?.valid && (
+                <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/35 space-y-1.5 text-xs">
+                  <div className="font-black text-emerald-300 flex items-center justify-between">
+                    <span>✓ کلید معتبر و آماده اجراست</span>
+                    <span className="text-[10px] text-slate-300">
+                      بررسی در {byokDraftVerifiedInfo.checkedAt}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-300">
+                    مدل‌های مجاز روی این کلید:{' '}
+                    <span dir="ltr" className="font-mono text-[#14dac3]">
+                      {byokDraftVerifiedInfo.models.slice(0, 6).join(' · ')}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== EXPLICIT WORKSPACE CONFIRMATION MODAL ==================== */}
+      {workspaceConfirmModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-[#0F1420] border border-slate-700 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4 text-right text-slate-100">
+            <div className="flex items-center gap-2.5">
+              <div className="w-10 h-10 rounded-xl bg-[#08cdbd]/20 text-[#14dac3] flex items-center justify-center shrink-0">
+                <ShieldAlert className="w-5 h-5" />
+              </div>
+              <h3 className="text-sm font-black text-white">
+                {workspaceConfirmModal.title}
+              </h3>
+            </div>
+
+            <p className="text-xs text-slate-300 leading-relaxed">
+              {workspaceConfirmModal.description}
+            </p>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                disabled={isExecutingWorkspaceConfirm}
+                onClick={() => setWorkspaceConfirmModal(null)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-slate-200 cursor-pointer"
+              >
+                انصراف
+              </button>
+              <button
+                type="button"
+                disabled={isExecutingWorkspaceConfirm}
+                onClick={async () => {
+                  setIsExecutingWorkspaceConfirm(true);
+                  try {
+                    await workspaceConfirmModal.onConfirm();
+                    setWorkspaceConfirmModal(null);
+                  } catch (err: any) {
+                    setExportStatusMessage(
+                      err?.message || 'خطا در اجرای عملیات Google Workspace.'
+                    );
+                    setTimeout(() => setExportStatusMessage(null), 4000);
+                    setWorkspaceConfirmModal(null);
+                  } finally {
+                    setIsExecutingWorkspaceConfirm(false);
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[#08cdbd] hover:bg-[#14dac3] text-xs font-black text-[#062959] cursor-pointer"
+              >
+                {isExecutingWorkspaceConfirm && (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                )}
+                <span>{workspaceConfirmModal.confirmLabel}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ==================== OFFICIAL ARKA FOOTER ==================== */}
       <footer className="max-w-[1440px] w-full mx-auto px-4 sm:px-6 py-5 border-t border-[#e3e9ed] flex flex-wrap items-center justify-between gap-4 text-xs text-[#7e8c9b]">
